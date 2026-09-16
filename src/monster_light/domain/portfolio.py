@@ -73,6 +73,22 @@ class Portfolio:
         self._cash = cash
         self._positions: dict[str, int] = {}
 
+    @classmethod
+    def restore(cls, cash: Decimal, positions: Mapping[str, int]) -> "Portfolio":
+        """Restore a validated snapshot without replaying trades.
+
+        Stored symbols must already be normalized; reject corrupt state rather
+        than silently repairing it. Copy positions to retain domain ownership.
+        """
+        portfolio = cls(cash)
+        restored = dict(positions)
+        for symbol, quantity in restored.items():
+            if _symbol(symbol) != symbol:
+                raise InvalidSymbol("Stored symbols must be normalized")
+            _quantity(quantity)
+        portfolio._positions = restored
+        return portfolio
+
     @property
     def cash(self) -> Decimal:
         return self._cash
