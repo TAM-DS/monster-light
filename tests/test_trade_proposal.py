@@ -214,6 +214,8 @@ def test_sql_status_transition_matrix(database, initial, result):
     _, connection, repository = database
     proposal = candidate()
     repository.save(proposal)
+    if initial is ProposalStatus.EXECUTED:
+        repository.mark_approved(proposal.proposal_id)
     if initial is not ProposalStatus.PENDING:
         connection.execute(
             'UPDATE trade_proposals SET status = ?, rejection_reason = ?',
@@ -221,7 +223,11 @@ def test_sql_status_transition_matrix(database, initial, result):
         )
     parameters = (result.value, 'No thanks' if result is ProposalStatus.REJECTED else None)
     statement = 'UPDATE trade_proposals SET status = ?, rejection_reason = ?'
-    if initial is ProposalStatus.PENDING and result is not ProposalStatus.PENDING:
+    if (initial, result) in {
+        (ProposalStatus.PENDING, ProposalStatus.APPROVED),
+        (ProposalStatus.PENDING, ProposalStatus.REJECTED),
+        (ProposalStatus.APPROVED, ProposalStatus.EXECUTED),
+    }:
         connection.execute(statement, parameters)
         assert repository.load(proposal.proposal_id).status is result
     else:
@@ -289,3 +295,102 @@ def test_legacy_schema_migration_preserves_history_and_transaction(tmp_path, rol
             connection.execute("UPDATE trade_proposals SET symbol = 'Changed'")
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize('rollback', [False, True])
+@pytest.mark.parametrize('foreign_keys', [False, True])
+def test_pre_execution_migration_preserves_approvals(tmp_path, rollback, foreign_keys):
+    from monster_light.application.approval import ApprovalService
+    from monster_light.infrastructure.sqlite_approval_repository import SQLiteApprovalRepository
+
+    # Build the immediately preceding schema, including its named triggers.
+    with sqlite3.connect(':memory:') as template:
+        SQLiteProposalRepository(template).initialize_schema()
+        table = template.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'trade_proposals'"
+        ).fetchone()[0].replace(", 'EXECUTED'", '')
+        triggers = template.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'trade_proposals'"
+        ).fetchall()
+    connection = sqlite3.connect(tmp_path / 'approved-legacy.sqlite')
+    try:
+        connection.execute(f'PRAGMA foreign_keys = {int(foreign_keys)}')
+        connection.execute(table)
+        for (trigger,) in triggers:
+            connection.execute(trigger.replace(
+                "WHEN NOT ((OLD.status = 'PENDING' AND NEW.status IN ('APPROVED', 'REJECTED'))\n"
+                "                      OR (OLD.status = 'APPROVED' AND NEW.status = 'EXECUTED'))",
+                "WHEN OLD.status != 'PENDING' OR NEW.status NOT IN ('APPROVED', 'REJECTED')",
+            ))
+        proposals = SQLiteProposalRepository(connection)
+        pending, approved, rejected = candidate(), candidate(), candidate()
+        for proposal in (pending, approved, rejected):
+            proposals.save(proposal)
+        approval = ApprovalService(proposals).approve(approved.proposal_id, 'Human')
+        approved = proposals.load(approved.proposal_id)
+        rejected = proposals.reject(rejected.proposal_id, 'No')
+        approval_schema = connection.execute(
+            "SELECT name, sql FROM sqlite_master WHERE tbl_name = 'human_approvals' ORDER BY name"
+        ).fetchall()
+        connection.execute('BEGIN')
+        connection.execute('PRAGMA defer_foreign_keys = ON')
+        proposals.initialize_schema()
+        proposals.initialize_schema()
+        assert connection.in_transaction
+        assert connection.execute('PRAGMA defer_foreign_keys').fetchone()[0] == 1
+        assert connection.execute('PRAGMA foreign_keys').fetchone()[0] == int(foreign_keys)
+        assert connection.execute('PRAGMA legacy_alter_table').fetchone()[0] == 0
+        for proposal in (pending, approved, rejected):
+            assert proposals.load(proposal.proposal_id) == proposal
+        assert SQLiteApprovalRepository(connection).load(approved.proposal_id) == approval
+        assert connection.execute(
+            "SELECT name, sql FROM sqlite_master WHERE tbl_name = 'human_approvals' ORDER BY name"
+        ).fetchall() == approval_schema
+        assert connection.execute('PRAGMA foreign_key_check').fetchall() == []
+        proposals.mark_executed(approved.proposal_id)
+        if rollback:
+            connection.rollback()
+            assert proposals.load(approved.proposal_id) == approved
+            with pytest.raises(sqlite3.IntegrityError):
+                proposals.mark_executed(approved.proposal_id)
+            proposals.initialize_schema()
+            proposals.mark_executed(approved.proposal_id)
+        else:
+            connection.commit()
+        assert proposals.load(approved.proposal_id).status is ProposalStatus.EXECUTED
+        # The existing approval trigger still points at the real proposal table.
+        ApprovalService(proposals).approve(pending.proposal_id, 'Another human')
+        assert SQLiteApprovalRepository(connection).load(approved.proposal_id) == approval
+        assert connection.execute('PRAGMA foreign_key_check').fetchall() == []
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("UPDATE trade_proposals SET symbol = 'changed'")
+    finally:
+        connection.close()
+
+
+def test_mark_executed_guards_and_terminal_state(database):
+    from monster_light.application.approval import ApprovalService
+    from monster_light.application.proposal import ProposalAlreadyExecuted, ProposalNotApproved
+
+    _, _, repository = database
+    pending, rejected, approved = candidate(), candidate(), candidate()
+    for proposal in (pending, rejected, approved):
+        repository.save(proposal)
+    repository.reject(rejected.proposal_id, 'No')
+    for proposal in (pending, rejected):
+        with pytest.raises(ProposalNotApproved):
+            repository.mark_executed(proposal.proposal_id)
+    with pytest.raises(ProposalNotFound):
+        repository.mark_executed('unknown')
+    ApprovalService(repository).approve(approved.proposal_id, 'Human')
+    executed = repository.mark_executed(approved.proposal_id)
+    assert executed == replace(approved, status=ProposalStatus.EXECUTED)
+    for operation in (
+        lambda: repository.mark_executed(approved.proposal_id),
+        lambda: repository.mark_approved(approved.proposal_id),
+        lambda: repository.reject(approved.proposal_id, 'No'),
+        lambda: ApprovalService(repository).approve(approved.proposal_id, 'Human'),
+    ):
+        with pytest.raises(ProposalAlreadyExecuted):
+            operation()
+    assert repository.load(approved.proposal_id) == executed

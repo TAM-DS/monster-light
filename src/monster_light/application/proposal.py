@@ -17,6 +17,7 @@ class ProposalStatus(Enum):
     PENDING = "PENDING"
     APPROVED = "APPROVED"
     REJECTED = "REJECTED"
+    EXECUTED = "EXECUTED"
 
 
 class ProposalNotFound(LookupError):
@@ -28,7 +29,15 @@ class ProposalAlreadyRejected(ValueError):
 
 
 class ProposalAlreadyApproved(ValueError):
-    """An approved proposal is terminal."""
+    """An approved proposal cannot be approved again or rejected."""
+
+
+class ProposalNotApproved(ValueError):
+    """Execution requires an approved proposal."""
+
+
+class ProposalAlreadyExecuted(ValueError):
+    """An executed proposal is terminal."""
 
 
 def _nonempty(value: str, name: str) -> None:
