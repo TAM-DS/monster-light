@@ -5,7 +5,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from monster_light.application.proposal import (
-    ProposalAlreadyRejected, ProposalNotFound, ProposalOrigin, ProposalStatus,
+    ProposalAlreadyApproved, ProposalAlreadyRejected, ProposalNotFound, ProposalOrigin, ProposalStatus,
     TradeProposal,
 )
 from monster_light.application.trade_service import TradeSide
@@ -23,6 +23,24 @@ class SQLiteProposalRepository:
         self.connection = connection
 
     def initialize_schema(self) -> None:
+        with sqlite_savepoint(self.connection):
+            schema = self.connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'trade_proposals'"
+            ).fetchone()
+            # The original CHECK constraint cannot be expanded with ALTER TABLE.
+            legacy = schema is not None and "'APPROVED'" not in schema[0]
+            if legacy:
+                for trigger in ("immutable_terms", "reject_only", "no_delete", "no_replace"):
+                    self.connection.execute(f"DROP TRIGGER IF EXISTS trade_proposals_{trigger}")
+                self.connection.execute("ALTER TABLE trade_proposals RENAME TO legacy_trade_proposals")
+            self._create_schema()
+            if legacy:
+                self.connection.execute(
+                    "INSERT INTO trade_proposals SELECT * FROM legacy_trade_proposals"
+                )
+                self.connection.execute("DROP TABLE legacy_trade_proposals")
+
+    def _create_schema(self) -> None:
         self.connection.execute("""
             CREATE TABLE IF NOT EXISTS trade_proposals (
                 proposal_id TEXT PRIMARY KEY NOT NULL,
@@ -35,9 +53,9 @@ class SQLiteProposalRepository:
                     CHECK (typeof(quantity) = 'integer' AND quantity > 0),
                 price TEXT NOT NULL CHECK (typeof(price) = 'text'),
                 rationale TEXT NOT NULL,
-                status TEXT NOT NULL CHECK (status IN ('PENDING', 'REJECTED')),
+                status TEXT NOT NULL CHECK (status IN ('PENDING', 'APPROVED', 'REJECTED')),
                 rejection_reason TEXT,
-                CHECK ((status = 'PENDING' AND rejection_reason IS NULL) OR
+                CHECK ((status IN ('PENDING', 'APPROVED') AND rejection_reason IS NULL) OR
                        (status = 'REJECTED' AND rejection_reason IS NOT NULL
                         AND length(trim(rejection_reason)) > 0))
             )
@@ -49,10 +67,10 @@ class SQLiteProposalRepository:
             BEGIN SELECT RAISE(ABORT, 'Proposal terms are immutable'); END
         """)
         self.connection.execute("""
-            CREATE TRIGGER IF NOT EXISTS trade_proposals_reject_only
+            CREATE TRIGGER IF NOT EXISTS trade_proposals_transition_only
             BEFORE UPDATE ON trade_proposals
-            WHEN OLD.status != 'PENDING' OR NEW.status != 'REJECTED'
-            BEGIN SELECT RAISE(ABORT, 'Only PENDING proposals may be rejected'); END
+            WHEN OLD.status != 'PENDING' OR NEW.status NOT IN ('APPROVED', 'REJECTED')
+            BEGIN SELECT RAISE(ABORT, 'Only PENDING proposals may be approved or rejected'); END
         """)
         self.connection.execute("""
             CREATE TRIGGER IF NOT EXISTS trade_proposals_no_delete
@@ -117,5 +135,21 @@ class SQLiteProposalRepository:
             """, (reason, proposal_id))
             proposal = self.load(proposal_id)
             if updated.rowcount != 1:
+                if proposal.status is ProposalStatus.APPROVED:
+                    raise ProposalAlreadyApproved(proposal_id)
                 raise ProposalAlreadyRejected(proposal_id)
+            return proposal
+
+    def mark_approved(self, proposal_id: str) -> TradeProposal:
+        """Used by ApprovalService inside the approval evidence savepoint."""
+        with sqlite_savepoint(self.connection):
+            updated = self.connection.execute("""
+                UPDATE trade_proposals SET status = 'APPROVED'
+                WHERE proposal_id = ? AND status = 'PENDING'
+            """, (proposal_id,))
+            proposal = self.load(proposal_id)
+            if updated.rowcount != 1:
+                if proposal.status is ProposalStatus.REJECTED:
+                    raise ProposalAlreadyRejected(proposal_id)
+                raise ProposalAlreadyApproved(proposal_id)
             return proposal

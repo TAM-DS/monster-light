@@ -206,3 +206,86 @@ def test_outer_transaction_ownership(database, commit):
         connection.rollback()
         with pytest.raises(ProposalNotFound):
             repository.load(proposal.proposal_id)
+
+
+@pytest.mark.parametrize('initial', list(ProposalStatus))
+@pytest.mark.parametrize('result', list(ProposalStatus))
+def test_sql_status_transition_matrix(database, initial, result):
+    _, connection, repository = database
+    proposal = candidate()
+    repository.save(proposal)
+    if initial is not ProposalStatus.PENDING:
+        connection.execute(
+            'UPDATE trade_proposals SET status = ?, rejection_reason = ?',
+            (initial.value, 'No thanks' if initial is ProposalStatus.REJECTED else None),
+        )
+    parameters = (result.value, 'No thanks' if result is ProposalStatus.REJECTED else None)
+    statement = 'UPDATE trade_proposals SET status = ?, rejection_reason = ?'
+    if initial is ProposalStatus.PENDING and result is not ProposalStatus.PENDING:
+        connection.execute(statement, parameters)
+        assert repository.load(proposal.proposal_id).status is result
+    else:
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(statement, parameters)
+        assert repository.load(proposal.proposal_id).status is initial
+
+
+@pytest.mark.parametrize('rollback', [False, True])
+def test_legacy_schema_migration_preserves_history_and_transaction(tmp_path, rollback):
+    from monster_light.application.approval import ApprovalService
+
+    connection = sqlite3.connect(tmp_path / 'legacy.sqlite')
+    try:
+        # Recreate the pre-approval table and its original transition constraint.
+        connection.execute("""
+            CREATE TABLE trade_proposals (
+                proposal_id TEXT PRIMARY KEY NOT NULL,
+                created_at TEXT NOT NULL,
+                origin TEXT NOT NULL CHECK (origin = 'MANUAL'),
+                portfolio_id TEXT NOT NULL,
+                side TEXT NOT NULL CHECK (side IN ('BUY', 'SELL')),
+                symbol TEXT NOT NULL,
+                quantity INTEGER NOT NULL
+                    CHECK (typeof(quantity) = 'integer' AND quantity > 0),
+                price TEXT NOT NULL CHECK (typeof(price) = 'text'),
+                rationale TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('PENDING', 'REJECTED')),
+                rejection_reason TEXT,
+                CHECK ((status = 'PENDING' AND rejection_reason IS NULL) OR
+                       (status = 'REJECTED' AND rejection_reason IS NOT NULL
+                        AND length(trim(rejection_reason)) > 0))
+            )
+        """)
+        connection.execute("""
+            CREATE TRIGGER trade_proposals_reject_only BEFORE UPDATE ON trade_proposals
+            WHEN OLD.status != 'PENDING' OR NEW.status != 'REJECTED'
+            BEGIN SELECT RAISE(ABORT, 'Only PENDING proposals may be rejected'); END
+        """)
+        repository = SQLiteProposalRepository(connection)
+        pending, rejected = candidate(), candidate()
+        repository.save(pending)
+        repository.save(rejected)
+        rejected = repository.reject(rejected.proposal_id, 'Not suitable')
+        connection.execute('BEGIN')
+        repository.initialize_schema()
+        repository.initialize_schema()
+        assert connection.in_transaction
+        assert repository.load(pending.proposal_id) == pending
+        assert repository.load(rejected.proposal_id) == rejected
+        ApprovalService(repository).approve(pending.proposal_id, 'Human')
+        if rollback:
+            connection.rollback()
+            assert repository.load(pending.proposal_id) == pending
+            with pytest.raises(sqlite3.IntegrityError):
+                repository.mark_approved(pending.proposal_id)
+            connection.rollback()
+            repository.initialize_schema()
+            ApprovalService(repository).approve(pending.proposal_id, 'Human')
+        else:
+            connection.commit()
+        assert repository.load(pending.proposal_id) == replace(pending, status=ProposalStatus.APPROVED)
+        assert repository.load(rejected.proposal_id) == rejected
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("UPDATE trade_proposals SET symbol = 'Changed'")
+    finally:
+        connection.close()

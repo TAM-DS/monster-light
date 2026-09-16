@@ -15,6 +15,7 @@ class ProposalOrigin(Enum):
 
 class ProposalStatus(Enum):
     PENDING = "PENDING"
+    APPROVED = "APPROVED"
     REJECTED = "REJECTED"
 
 
@@ -23,7 +24,11 @@ class ProposalNotFound(LookupError):
 
 
 class ProposalAlreadyRejected(ValueError):
-    """A rejected proposal cannot be rejected again."""
+    """A rejected proposal is terminal."""
+
+
+class ProposalAlreadyApproved(ValueError):
+    """An approved proposal is terminal."""
 
 
 def _nonempty(value: str, name: str) -> None:
@@ -64,4 +69,4 @@ class TradeProposal:
         if self.status is ProposalStatus.REJECTED:
             _nonempty(self.rejection_reason, "rejection_reason")
         elif self.rejection_reason is not None:
-            raise ValueError("PENDING proposals cannot have a rejection reason")
+            raise ValueError("Only REJECTED proposals may have a rejection reason")
