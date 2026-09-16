@@ -41,6 +41,24 @@ class PortfolioTests(unittest.TestCase):
             InsufficientShares, self.portfolio.sell, "AAPL", 3, Decimal("12")
         )
 
+    def test_quantity_for_normalizes_symbols_without_mutation(self):
+        self.portfolio.buy("AAPL", 2, Decimal("10"))
+        before = (self.portfolio.cash, dict(self.portfolio.positions))
+        for symbol, expected in (("AAPL", 2), (" aApL \t", 2), ("MSFT", 0), (" msft ", 0)):
+            with self.subTest(symbol=symbol):
+                quantity = self.portfolio.quantity_for(symbol)
+                self.assertIs(type(quantity), int)
+                self.assertEqual(quantity, expected)
+        self.assertEqual((self.portfolio.cash, dict(self.portfolio.positions)), before)
+        self.portfolio.sell("AAPL", 2, Decimal("10"))
+        self.assertEqual(self.portfolio.quantity_for(" aapl "), 0)
+
+    def test_quantity_for_rejects_invalid_symbols_without_mutation(self):
+        self.portfolio.buy("AAPL", 2, Decimal("10"))
+        for symbol in ("", " \t", None, 123, []):
+            with self.subTest(symbol=symbol):
+                self.assert_rejected(InvalidSymbol, self.portfolio.quantity_for, symbol)
+
     def test_insufficient_cash_rejected_without_mutation(self):
         self.portfolio.buy("AAPL", 1, Decimal("10"))
         for symbol in ("AAPL", "MSFT"):

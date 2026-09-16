@@ -97,6 +97,10 @@ class Portfolio:
     def positions(self) -> Mapping[str, int]:
         return MappingProxyType(self._positions)
 
+    def quantity_for(self, symbol: str) -> int:
+        """Return owned shares, or zero if absent; raise InvalidSymbol if invalid."""
+        return self._positions.get(_symbol(symbol), 0)
+
     def buy(self, symbol: str, quantity: int, price: Decimal) -> None:
         symbol = _symbol(symbol)
         _quantity(quantity)
