@@ -12,17 +12,19 @@ class SQLiteAuditRepository:
         self.connection = connection
 
     def initialize_schema(self) -> None:
-        # Rebuild the legacy DIRECT-only CHECK atomically, including protections.
+        # Rebuild either historical schema atomically, including protections.
         # Savepoints preserve ownership of any caller transaction.
         with sqlite_savepoint(self.connection):
             columns = self.connection.execute("PRAGMA table_info(trade_audits)").fetchall()
-            legacy = bool(columns) and "proposal_id" not in {row[1] for row in columns}
+            legacy = bool(columns) and "market_evidence_id" not in {row[1] for row in columns}
             if legacy:
                 self.connection.execute("ALTER TABLE trade_audits RENAME TO trade_audits_legacy")
             self._create_table()
             if legacy:
+                missing = 3 if "proposal_id" not in {row[1] for row in columns} else 1
                 self.connection.execute(
-                    "INSERT INTO trade_audits SELECT *, NULL, NULL FROM trade_audits_legacy"
+                    "INSERT INTO trade_audits SELECT *" + ", NULL" * missing
+                    + " FROM trade_audits_legacy"
                 )
                 self.connection.execute("DROP TABLE trade_audits_legacy")
             self._create_triggers()
@@ -47,8 +49,13 @@ class SQLiteAuditRepository:
                 quantity_after INTEGER,
                 proposal_id TEXT,
                 approval_id TEXT,
+                market_evidence_id TEXT,
+                -- Historical proposal audits honestly retain NULL evidence IDs.
+                -- ExecutionAuditContext requires all three IDs for new executions;
+                -- SQL permits legacy NULLs without coupling history to other tables.
                 CHECK (
-                    (origin = 'DIRECT' AND proposal_id IS NULL AND approval_id IS NULL)
+                    (origin = 'DIRECT' AND proposal_id IS NULL AND approval_id IS NULL
+                        AND market_evidence_id IS NULL)
                     OR (origin = 'APPROVED_PROPOSAL'
                         AND proposal_id IS NOT NULL AND length(trim(proposal_id)) > 0
                         AND approval_id IS NOT NULL AND length(trim(approval_id)) > 0)
@@ -78,6 +85,6 @@ class SQLiteAuditRepository:
             for value in astuple(audit)
         )
         self.connection.execute(
-            "INSERT INTO trade_audits VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO trade_audits VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             values,
         )

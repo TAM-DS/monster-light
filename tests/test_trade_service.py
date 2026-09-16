@@ -74,7 +74,7 @@ def test_trade_loads_authoritative_state_and_persists(
     (TradeSide.SELL, "AAPL", 1, Decimal("-1"), InvalidMoney),
 ])
 @pytest.mark.parametrize("context", [ExecutionAuditContext(), ExecutionAuditContext(
-    AuditOrigin.APPROVED_PROPOSAL, "unverified-proposal", "unverified-approval")])
+    AuditOrigin.APPROVED_PROPOSAL, "unverified-proposal", "unverified-approval", "test-market-evidence")])
 def test_domain_rejection_never_saves(database, monkeypatch, side, symbol, quantity, price, error, context):
     path, _, repository = database
     save = Mock(wraps=repository.save)
@@ -120,7 +120,7 @@ def test_invalid_identifier_rejected_before_repository_access(database, portfoli
 
 @pytest.mark.parametrize("side", ["BUY", "SELL", "HOLD", "buy", None, 1])
 @pytest.mark.parametrize("context", [ExecutionAuditContext(), ExecutionAuditContext(
-    AuditOrigin.APPROVED_PROPOSAL, "unverified-proposal", "unverified-approval")])
+    AuditOrigin.APPROVED_PROPOSAL, "unverified-proposal", "unverified-approval", "test-market-evidence")])
 def test_only_explicit_trade_sides_are_accepted(database, side, context):
     _, _, repository = database
     observed = Mock(wraps=repository)

@@ -74,6 +74,7 @@ class TradeService:
                 origin=audit_context.origin,
                 proposal_id=audit_context.proposal_id,
                 approval_id=audit_context.approval_id,
+                market_evidence_id=audit_context.market_evidence_id,
                 portfolio_id=request.portfolio_id,
                 side=request.side.value,
                 symbol=request.symbol if isinstance(request.symbol, str) else repr(request.symbol),

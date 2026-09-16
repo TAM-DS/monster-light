@@ -1,5 +1,10 @@
 """Execute approved immutable terms through the existing trusted trade service."""
 
+from collections.abc import Callable
+from datetime import datetime, timedelta
+
+from monster_light.application.market_evidence import MarketEvidenceMismatch, validate_maximum_age
+from monster_light.infrastructure.sqlite_market_evidence_repository import SQLiteMarketEvidenceRepository
 from monster_light.application.audit import AuditOrigin, ExecutionAuditContext
 from monster_light.application.proposal import (
     ProposalAlreadyExecuted, ProposalNotApproved, ProposalStatus,
@@ -23,10 +28,16 @@ class ApprovedProposalExecutionService:
     audit evidence. SQLite locking governs concurrent execution attempts.
     """
 
-    def __init__(self, repository: SQLiteProposalRepository) -> None:
+    def __init__(
+        self, repository: SQLiteProposalRepository, *,
+        maximum_age: timedelta, clock: Callable[[], datetime],
+    ) -> None:
+        validate_maximum_age(maximum_age)
+        self._maximum_age = maximum_age
+        self._clock = clock
         self._repository = repository
 
-    def execute(self, proposal_id: str) -> Portfolio:
+    def execute(self, proposal_id: str, market_evidence_id: str) -> Portfolio:
         connection = self._repository.connection
         rejection = None
         with sqlite_savepoint(connection):
@@ -40,6 +51,12 @@ class ApprovedProposalExecutionService:
             approval = approvals.load(proposal_id)
             if approval is None:
                 raise HumanApprovalRequired(proposal_id)
+            evidence_repository = SQLiteMarketEvidenceRepository(connection)
+            evidence_repository.initialize_schema()
+            evidence = evidence_repository.load(market_evidence_id)
+            if evidence.symbol != proposal.symbol or evidence.price != proposal.price:
+                raise MarketEvidenceMismatch(market_evidence_id)
+            evidence.validate_freshness(now=self._clock(), maximum_age=self._maximum_age)
             request = TradeRequest(
                 portfolio_id=proposal.portfolio_id, side=proposal.side,
                 symbol=proposal.symbol, quantity=proposal.quantity, price=proposal.price,
@@ -51,6 +68,7 @@ class ApprovedProposalExecutionService:
                         origin=AuditOrigin.APPROVED_PROPOSAL,
                         proposal_id=proposal.proposal_id,
                         approval_id=approval.approval_id,
+                        market_evidence_id=evidence.evidence_id,
                     ),
                 )
             except (PortfolioError, PortfolioNotFound) as error:

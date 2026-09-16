@@ -55,6 +55,7 @@ def test_accepted_evidence_survives_reopening(database, side, quantity, cash, ow
         assert (row["origin"], row["outcome"], row["reason_code"]) == ("DIRECT", "ACCEPTED", "TradeExecuted")
         assert row["proposal_id"] is None
         assert row["approval_id"] is None
+        assert row["market_evidence_id"] is None
         assert row["reason_message"]
         assert (row["portfolio_id"], row["side"], row["symbol"]) == ("one", side.value, " aapl ")
         assert (row["quantity"], row["price"]) == (str(quantity), "10.250")
@@ -165,7 +166,7 @@ def test_outer_transaction_retains_ownership(database, commit, rejected):
     "INSERT INTO trade_audits SELECT * FROM trade_audits",
 ])
 @pytest.mark.parametrize("context", [ExecutionAuditContext(), ExecutionAuditContext(
-    AuditOrigin.APPROVED_PROPOSAL, "proposal", "approval")])
+    AuditOrigin.APPROVED_PROPOSAL, "proposal", "approval", "test-evidence")])
 def test_evidence_cannot_be_rewritten(database, statement, context):
     _, connection, repository = database
     request = TradeRequest("one", TradeSide.BUY, "AAPL", 1, Decimal("0.1234567890123456789012345"))
@@ -277,7 +278,7 @@ def test_legacy_direct_migration_preserves_evidence_and_protections(tmp_path, ou
             connection.execute("BEGIN")
         repository.initialize_schema()
         assert connection.in_transaction is outer
-        assert connection.execute("SELECT * FROM trade_audits").fetchone() == old + (None, None)
+        assert connection.execute("SELECT * FROM trade_audits").fetchone() == old + (None, None, None)
         if outer:
             connection.rollback()
             assert connection.execute("SELECT * FROM trade_audits").fetchone() == old
@@ -292,13 +293,73 @@ def test_legacy_direct_migration_preserves_evidence_and_protections(tmp_path, ou
                 connection.execute(statement)
         connection.rollback()
     with sqlite3.connect(path) as reopened:
-        assert reopened.execute("SELECT * FROM trade_audits").fetchone() == old + (None, None)
+        assert reopened.execute("SELECT * FROM trade_audits").fetchone() == old + (None, None, None)
         portfolios = SQLitePortfolioRepository(reopened)
         portfolios.initialize_schema()
         portfolios.save("one", Portfolio(Decimal("10")))
         TradeService(portfolios).execute(
             TradeRequest("one", TradeSide.BUY, "AAPL", 1, Decimal("1")),
-            audit_context=ExecutionAuditContext(AuditOrigin.APPROVED_PROPOSAL, "proposal", "approval"),
+            audit_context=ExecutionAuditContext(AuditOrigin.APPROVED_PROPOSAL, "proposal", "approval", "test-evidence"),
         )
-        assert reopened.execute("SELECT origin, proposal_id, approval_id FROM trade_audits WHERE audit_id != 'old-id'").fetchone() == (
-            "APPROVED_PROPOSAL", "proposal", "approval")
+        assert reopened.execute("SELECT origin, proposal_id, approval_id, market_evidence_id FROM trade_audits WHERE audit_id != 'old-id'").fetchone() == (
+            "APPROVED_PROPOSAL", "proposal", "approval", "test-evidence")
+
+
+@pytest.mark.parametrize('origin,proposal,approval,evidence', [
+    (AuditOrigin.DIRECT, None, None, 'evidence'),
+    (AuditOrigin.DIRECT, 'proposal', None, None),
+    (AuditOrigin.DIRECT, None, 'approval', None),
+    (AuditOrigin.APPROVED_PROPOSAL, 'proposal', 'approval', None),
+    (AuditOrigin.APPROVED_PROPOSAL, 'proposal', 'approval', ''),
+    (AuditOrigin.APPROVED_PROPOSAL, 'proposal', 'approval', ' \t'),
+    (AuditOrigin.APPROVED_PROPOSAL, None, 'approval', 'evidence'),
+    (AuditOrigin.APPROVED_PROPOSAL, 'proposal', None, 'evidence'),
+])
+def test_new_context_requires_honest_complete_provenance(origin, proposal, approval, evidence):
+    with pytest.raises(ValueError):
+        ExecutionAuditContext(origin, proposal, approval, evidence)
+
+
+@pytest.mark.parametrize('outer', [False, True])
+def test_historical_proposal_audit_migration(tmp_path, outer):
+    path = tmp_path / 'historical.sqlite'
+    with sqlite3.connect(path) as connection:
+        # Recreate the immediately preceding schema, including its constraints.
+        connection.execute('''CREATE TABLE trade_audits (
+            audit_id TEXT PRIMARY KEY NOT NULL, timestamp TEXT NOT NULL,
+            origin TEXT NOT NULL CHECK (origin IN ('DIRECT', 'APPROVED_PROPOSAL')),
+            portfolio_id TEXT NOT NULL, side TEXT NOT NULL, symbol TEXT NOT NULL,
+            quantity TEXT NOT NULL, price TEXT NOT NULL, outcome TEXT NOT NULL,
+            reason_code TEXT NOT NULL, reason_message TEXT NOT NULL,
+            cash_before TEXT, cash_after TEXT, quantity_before INTEGER, quantity_after INTEGER,
+            proposal_id TEXT, approval_id TEXT,
+            CHECK ((origin = 'DIRECT' AND proposal_id IS NULL AND approval_id IS NULL)
+                OR (origin = 'APPROVED_PROPOSAL' AND proposal_id IS NOT NULL AND approval_id IS NOT NULL))
+        )''')
+        old = ('historical', '2026-01-01T00:00:00+00:00', 'APPROVED_PROPOSAL',
+               'one', 'SELL', 'AAPL', '500', '1.000', 'REJECTED', 'InsufficientShares',
+               'Not enough shares', '2.000', '2.000', 2, 2, 'original-proposal', 'original-approval')
+        direct = ('direct',) + old[1:2] + ('DIRECT',) + old[3:15] + (None, None)
+        connection.executemany('INSERT INTO trade_audits VALUES (' + ','.join('?' for _ in old) + ')',
+                               [old, direct])
+        repository = SQLiteAuditRepository(connection)
+        repository._create_triggers()
+        connection.commit()
+        if outer:
+            connection.execute('BEGIN')
+        repository.initialize_schema()
+        assert connection.in_transaction is outer
+        assert connection.execute('SELECT * FROM trade_audits ORDER BY rowid').fetchall() == [old + (None,), direct + (None,)]
+        if outer:
+            connection.rollback()
+            assert connection.execute('SELECT * FROM trade_audits ORDER BY rowid').fetchall() == [old, direct]
+            repository.initialize_schema()
+        repository.initialize_schema()
+        for statement in ("UPDATE trade_audits SET market_evidence_id = 'invented'",
+                          'DELETE FROM trade_audits',
+                          'INSERT OR REPLACE INTO trade_audits SELECT * FROM trade_audits'):
+            with pytest.raises(sqlite3.IntegrityError, match='append-only'):
+                connection.execute(statement)
+        connection.rollback()
+    with sqlite3.connect(path) as reopened:
+        assert reopened.execute('SELECT * FROM trade_audits ORDER BY rowid').fetchall() == [old + (None,), direct + (None,)]

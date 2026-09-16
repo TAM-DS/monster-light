@@ -3,6 +3,13 @@
 import sqlite3
 from dataclasses import replace
 from decimal import Decimal
+from datetime import datetime, timedelta, timezone
+
+from monster_light.application.market_evidence import (
+    MarketEvidence, MarketEvidenceNotFound, MarketEvidenceMismatch,
+    StaleMarketEvidence, InvalidMarketEvidenceTime,
+)
+from monster_light.infrastructure.sqlite_market_evidence_repository import SQLiteMarketEvidenceRepository
 
 import pytest
 
@@ -21,6 +28,9 @@ from monster_light.infrastructure.sqlite_proposal_repository import SQLitePropos
 from monster_light.infrastructure.sqlite_repository import SQLitePortfolioRepository
 
 
+NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
 @pytest.fixture
 def database(tmp_path):
     path = tmp_path / 'execution.sqlite'
@@ -34,7 +44,12 @@ def database(tmp_path):
     portfolios = SQLitePortfolioRepository(connection)
     portfolios.initialize_schema()
     portfolios.save(' one ', Portfolio.restore(Decimal('80.000'), {'AAPL': 2}))
-    yield path, connection, proposals, portfolios, ApprovedProposalExecutionService(proposals)
+    evidence = SQLiteMarketEvidenceRepository(connection)
+    evidence.initialize_schema()
+    evidence.append(MarketEvidence('evidence', 'caller', ' aApL \t', Decimal('10.2500'), NOW, NOW))
+    yield path, connection, proposals, portfolios, ApprovedProposalExecutionService(
+        proposals, maximum_age=timedelta(minutes=5), clock=lambda: NOW,
+    )
     connection.close()
 
 
@@ -72,7 +87,7 @@ def test_success_and_reopen(database, monkeypatch, side, cash, shares):
         return execute(self, request, **kwargs)
 
     monkeypatch.setattr(TradeService, 'execute', capture)
-    result = service.execute(proposal.proposal_id)
+    result = service.execute(proposal.proposal_id, 'evidence')
     assert seen == [TradeRequest(proposal.portfolio_id, side, proposal.symbol,
                                  proposal.quantity, proposal.price)]
     assert seen[0].price.as_tuple() == proposal.price.as_tuple()
@@ -80,6 +95,7 @@ def test_success_and_reopen(database, monkeypatch, side, cash, shares):
     assert result.positions == {'AAPL': shares}
     assert proposals.load(proposal.proposal_id) == replace(proposal, status=ProposalStatus.EXECUTED)
     row, = audits(connection)
+    assert row['market_evidence_id'] == 'evidence'
     assert (row['outcome'], row['reason_code'], row['origin']) == ('ACCEPTED', 'TradeExecuted', 'APPROVED_PROPOSAL')
     assert (row['proposal_id'], row['approval_id']) == (proposal.proposal_id, approval.approval_id)
     assert (row['portfolio_id'], row['side'], row['symbol'], row['quantity'], row['price']) == (
@@ -89,7 +105,7 @@ def test_success_and_reopen(database, monkeypatch, side, cash, shares):
     assert not connection.in_transaction
     before = tuple(row)
     with pytest.raises(ProposalAlreadyExecuted):
-        service.execute(proposal.proposal_id)
+        service.execute(proposal.proposal_id, 'evidence')
     assert [tuple(row) for row in audits(connection)] == [before]
     connection.close()
     with sqlite3.connect(path) as reopened:
@@ -100,8 +116,8 @@ def test_success_and_reopen(database, monkeypatch, side, cash, shares):
         portfolio = SQLitePortfolioRepository(reopened).load(' one ')
         assert portfolio.cash == Decimal(cash)
         assert portfolio.positions == {'AAPL': shares}
-        assert reopened.execute('SELECT origin, proposal_id, approval_id FROM trade_audits').fetchone() == (
-            'APPROVED_PROPOSAL', proposal.proposal_id, approval.approval_id)
+        assert reopened.execute('SELECT origin, proposal_id, approval_id, market_evidence_id FROM trade_audits').fetchone() == (
+            'APPROVED_PROPOSAL', proposal.proposal_id, approval.approval_id, 'evidence')
 
 
 @pytest.mark.parametrize('status', [ProposalStatus.PENDING, ProposalStatus.REJECTED])
@@ -116,7 +132,7 @@ def test_unapproved_cannot_reach_trade_service(database, monkeypatch, status):
 
     monkeypatch.setattr(TradeService, 'execute', forbidden)
     with pytest.raises(ProposalNotApproved):
-        service.execute(proposal.proposal_id)
+        service.execute(proposal.proposal_id, 'evidence')
     assert proposals.load(proposal.proposal_id).status is status
     assert audits(connection) == []
     assert_original(portfolios)
@@ -132,9 +148,9 @@ def test_missing_approval_and_unknown_id(database, monkeypatch):
 
     monkeypatch.setattr(TradeService, 'execute', forbidden)
     with pytest.raises(HumanApprovalRequired):
-        service.execute(proposal.proposal_id)
+        service.execute(proposal.proposal_id, 'evidence')
     with pytest.raises(ProposalNotFound):
-        service.execute('missing')
+        service.execute('missing', 'evidence')
     assert proposals.load(proposal.proposal_id).status is ProposalStatus.APPROVED
     assert audits(connection) == []
     assert_original(portfolios)
@@ -163,23 +179,24 @@ def test_rejection_keeps_decision_and_provenance(database, monkeypatch, side, qu
 
     monkeypatch.setattr(TradeService, 'execute', capture)
     with pytest.raises(error) as caught:
-        service.execute(proposal.proposal_id)
+        service.execute(proposal.proposal_id, 'evidence')
     assert caught.value is errors[0]
     assert proposals.load(proposal.proposal_id).status is ProposalStatus.APPROVED
     assert SQLiteApprovalRepository(connection).load(proposal.proposal_id) == approval
     after = portfolios.load(' one ')
     assert (after.cash, after.positions) == (before.cash, before.positions)
     row = audits(connection)[-1]
+    assert row['market_evidence_id'] == 'evidence'
     assert (row['outcome'], row['reason_code'], row['reason_message']) == (
         'REJECTED', error.__name__, str(caught.value))
-    assert (row['origin'], row['proposal_id'], row['approval_id']) == (
-        'APPROVED_PROPOSAL', proposal.proposal_id, approval.approval_id)
+    assert (row['origin'], row['proposal_id'], row['approval_id'], row['market_evidence_id']) == (
+        'APPROVED_PROPOSAL', proposal.proposal_id, approval.approval_id, 'evidence')
     assert connection.execute('SELECT count(*) FROM human_approvals').fetchone()[0] == 1
     assert not connection.in_transaction
     with sqlite3.connect(path) as observer:
         assert observer.execute(
-            "SELECT origin, proposal_id, approval_id FROM trade_audits WHERE outcome = 'REJECTED'"
-        ).fetchone() == ('APPROVED_PROPOSAL', proposal.proposal_id, approval.approval_id)
+            "SELECT origin, proposal_id, approval_id, market_evidence_id FROM trade_audits WHERE outcome = 'REJECTED'"
+        ).fetchone() == ('APPROVED_PROPOSAL', proposal.proposal_id, approval.approval_id, 'evidence')
 
 
 @pytest.mark.parametrize('after', [False, True])
@@ -200,7 +217,7 @@ def test_mark_failure_rolls_back_trade_and_audit(database, monkeypatch, after, o
 
     monkeypatch.setattr(proposals, 'mark_executed', fail)
     with pytest.raises(sqlite3.OperationalError, match='mark failed'):
-        service.execute(proposal.proposal_id)
+        service.execute(proposal.proposal_id, 'evidence')
     assert connection.in_transaction is outer
     assert_original(portfolios)
     assert proposals.load(proposal.proposal_id).status is ProposalStatus.APPROVED
@@ -220,9 +237,9 @@ def test_outer_transaction_is_caller_owned(database, commit, rejected):
     connection.execute('BEGIN')
     if rejected:
         with pytest.raises(InsufficientShares):
-            service.execute(proposal.proposal_id)
+            service.execute(proposal.proposal_id, 'evidence')
     else:
-        service.execute(proposal.proposal_id)
+        service.execute(proposal.proposal_id, 'evidence')
     assert connection.in_transaction
     assert len(audits(connection)) == 1
     with sqlite3.connect(path) as observer:
@@ -240,3 +257,92 @@ def test_outer_transaction_is_caller_owned(database, commit, rejected):
         assert portfolios.load(' one ').positions == {'AAPL': 1}
     else:
         assert_original(portfolios)
+
+
+@pytest.mark.parametrize('changes,error', [
+    (None, MarketEvidenceNotFound),
+    ({'symbol': 'AAPL'}, MarketEvidenceMismatch),
+    ({'price': Decimal('10.25') + Decimal('0.01')}, MarketEvidenceMismatch),
+    ({'observed_at': NOW - timedelta(minutes=30),
+      'retrieved_at': NOW - timedelta(seconds=1)}, StaleMarketEvidence),
+    ({'observed_at': NOW + timedelta(seconds=1),
+      'retrieved_at': NOW + timedelta(seconds=1)}, InvalidMarketEvidenceTime),
+    ({'retrieved_at': NOW + timedelta(seconds=1)}, InvalidMarketEvidenceTime),
+])
+def test_evidence_failure_is_preexecution(database, monkeypatch, changes, error):
+    _, connection, proposals, portfolios, service = database
+    proposal = candidate(proposals)
+    approval = ApprovalService(proposals).approve(proposal.proposal_id, 'Human')
+    evidence_repository = SQLiteMarketEvidenceRepository(connection)
+    if changes is not None:
+        evidence_repository.append(replace(evidence_repository.load('evidence'),
+                                           evidence_id='invalid', **changes))
+
+    def forbidden(*args, **kwargs):
+        pytest.fail('Invalid evidence reached TradeService')
+
+    monkeypatch.setattr(TradeService, 'execute', forbidden)
+    with pytest.raises(error):
+        service.execute(proposal.proposal_id, 'invalid')
+    assert_original(portfolios)
+    assert proposals.load(proposal.proposal_id) == replace(proposal, status=ProposalStatus.APPROVED)
+    assert SQLiteApprovalRepository(connection).load(proposal.proposal_id) == approval
+    assert connection.execute('SELECT count(*) FROM human_approvals').fetchone()[0] == 1
+    assert audits(connection) == []
+
+
+@pytest.mark.parametrize('window,accepted', [(299, False), (300, True), (301, True)])
+def test_execution_configured_boundary(database, window, accepted):
+    _, connection, proposals, portfolios, _ = database
+    proposal = candidate(proposals)
+    ApprovalService(proposals).approve(proposal.proposal_id, 'Human')
+    service = ApprovedProposalExecutionService(
+        proposals, maximum_age=timedelta(seconds=window),
+        clock=lambda: NOW + timedelta(seconds=300),
+    )
+    if accepted:
+        service.execute(proposal.proposal_id, 'evidence')
+        assert proposals.load(proposal.proposal_id).status is ProposalStatus.EXECUTED
+    else:
+        with pytest.raises(StaleMarketEvidence):
+            service.execute(proposal.proposal_id, 'evidence')
+        assert_original(portfolios)
+        assert proposals.load(proposal.proposal_id).status is ProposalStatus.APPROVED
+        assert audits(connection) == []
+
+
+def test_maximum_age_and_clock_are_explicit(database):
+    _, _, proposals, _, _ = database
+    with pytest.raises(TypeError):
+        ApprovedProposalExecutionService(proposals, clock=lambda: NOW)
+    with pytest.raises(TypeError):
+        ApprovedProposalExecutionService(proposals, maximum_age=timedelta(minutes=1))
+    with pytest.raises(ValueError):
+        ApprovedProposalExecutionService(proposals, maximum_age=timedelta(seconds=-1), clock=lambda: NOW)
+
+
+@pytest.mark.parametrize('observed,retrieved', [
+    ('not-a-time', NOW.isoformat()),
+    (NOW.replace(tzinfo=None).isoformat(), NOW.isoformat()),
+    ((NOW + timedelta(seconds=1)).isoformat(), NOW.isoformat()),
+])
+def test_persisted_incoherent_evidence_is_revalidated(database, monkeypatch, observed, retrieved):
+    _, connection, proposals, portfolios, service = database
+    proposal = candidate(proposals)
+    approval = ApprovalService(proposals).approve(proposal.proposal_id, 'Human')
+    # Simulate structurally invalid caller data inserted outside the repository.
+    connection.execute('INSERT INTO market_evidence VALUES (?, ?, ?, ?, ?, ?)',
+                       ('invalid', 'fixture', proposal.symbol, str(proposal.price), observed, retrieved))
+    connection.commit()
+
+    def forbidden(*args, **kwargs):
+        pytest.fail('Incoherent persisted evidence reached TradeService')
+
+    monkeypatch.setattr(TradeService, 'execute', forbidden)
+    with pytest.raises(InvalidMarketEvidenceTime):
+        service.execute(proposal.proposal_id, 'invalid')
+    assert_original(portfolios)
+    assert proposals.load(proposal.proposal_id).status is ProposalStatus.APPROVED
+    assert audits(connection) == []
+    assert SQLiteApprovalRepository(connection).load(proposal.proposal_id) == approval
+    assert connection.execute('SELECT count(*) FROM human_approvals').fetchone()[0] == 1

@@ -21,15 +21,18 @@ class ExecutionAuditContext:
     origin: AuditOrigin = AuditOrigin.DIRECT
     proposal_id: str | None = None
     approval_id: str | None = None
+    market_evidence_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.origin is AuditOrigin.DIRECT:
-            if self.proposal_id is not None or self.approval_id is not None:
-                raise ValueError("Direct execution cannot claim proposal or approval provenance")
+            if any(value is not None for value in (
+                self.proposal_id, self.approval_id, self.market_evidence_id,
+            )):
+                raise ValueError("Direct execution cannot claim proposal, approval, or market evidence provenance")
         elif self.origin is AuditOrigin.APPROVED_PROPOSAL:
-            for value in (self.proposal_id, self.approval_id):
+            for value in (self.proposal_id, self.approval_id, self.market_evidence_id):
                 if not isinstance(value, str) or not value.strip():
-                    raise ValueError("Proposal execution provenance requires both identifiers")
+                    raise ValueError("Proposal execution provenance requires all three identifiers")
         else:
             raise ValueError("Unsupported audit origin")
 
@@ -53,3 +56,4 @@ class TradeAudit:
     quantity_after: int | None
     proposal_id: str | None = None
     approval_id: str | None = None
+    market_evidence_id: str | None = None
