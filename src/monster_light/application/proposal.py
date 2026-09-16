@@ -11,6 +11,7 @@ from monster_light.application.trade_service import TradeSide
 
 class ProposalOrigin(Enum):
     MANUAL = "MANUAL"
+    AI = "AI"
 
 
 class ProposalStatus(Enum):
@@ -69,8 +70,8 @@ class TradeProposal:
         if (not isinstance(self.price, Decimal) or not self.price.is_finite()
                 or self.price <= 0):
             raise ValueError("price must be a positive finite Decimal")
-        if self.origin is not ProposalOrigin.MANUAL:
-            raise ValueError("origin must be ProposalOrigin.MANUAL")
+        if not isinstance(self.origin, ProposalOrigin):
+            raise ValueError("origin must be a ProposalOrigin")
         if not isinstance(self.created_at, datetime) or self.created_at.utcoffset() != timedelta(0):
             raise ValueError("created_at must be a UTC timestamp")
         if not isinstance(self.status, ProposalStatus):

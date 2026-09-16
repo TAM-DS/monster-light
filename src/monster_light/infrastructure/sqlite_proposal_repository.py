@@ -30,7 +30,9 @@ class SQLiteProposalRepository:
             ).fetchone()
             # Rebuild the parent without renaming it: approval references and
             # triggers must continue to name trade_proposals.
-            legacy = schema is not None and "'EXECUTED'" not in schema[0]
+            legacy = schema is not None and (
+                "'EXECUTED'" not in schema[0] or "'AI'" not in schema[0]
+            )
             if legacy:
                 self._migrate_schema()
             self._create_schema()
@@ -63,7 +65,7 @@ class SQLiteProposalRepository:
             CREATE TABLE IF NOT EXISTS {name} (
                 proposal_id TEXT PRIMARY KEY NOT NULL,
                 created_at TEXT NOT NULL,
-                origin TEXT NOT NULL CHECK (origin = 'MANUAL'),
+                origin TEXT NOT NULL CHECK (origin IN ('MANUAL', 'AI')),
                 portfolio_id TEXT NOT NULL,
                 side TEXT NOT NULL CHECK (side IN ('BUY', 'SELL')),
                 symbol TEXT NOT NULL,

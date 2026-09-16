@@ -299,7 +299,9 @@ def test_legacy_schema_migration_preserves_history_and_transaction(tmp_path, rol
 
 @pytest.mark.parametrize('rollback', [False, True])
 @pytest.mark.parametrize('foreign_keys', [False, True])
-def test_pre_execution_migration_preserves_approvals(tmp_path, rollback, foreign_keys):
+@pytest.mark.parametrize('legacy_version', ['pre_execution', 'pre_ai'])
+def test_legacy_migration_preserves_approvals(tmp_path, rollback, foreign_keys, legacy_version):
+    from monster_light.application.ai_proposal import AIProposalService
     from monster_light.application.approval import ApprovalService
     from monster_light.infrastructure.sqlite_approval_repository import SQLiteApprovalRepository
 
@@ -308,7 +310,9 @@ def test_pre_execution_migration_preserves_approvals(tmp_path, rollback, foreign
         SQLiteProposalRepository(template).initialize_schema()
         table = template.execute(
             "SELECT sql FROM sqlite_master WHERE name = 'trade_proposals'"
-        ).fetchone()[0].replace(", 'EXECUTED'", '')
+        ).fetchone()[0].replace("origin IN ('MANUAL', 'AI')", "origin = 'MANUAL'")
+        if legacy_version == 'pre_execution':
+            table = table.replace(", 'EXECUTED'", '')
         triggers = template.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'trade_proposals'"
         ).fetchall()
@@ -317,11 +321,13 @@ def test_pre_execution_migration_preserves_approvals(tmp_path, rollback, foreign
         connection.execute(f'PRAGMA foreign_keys = {int(foreign_keys)}')
         connection.execute(table)
         for (trigger,) in triggers:
-            connection.execute(trigger.replace(
-                "WHEN NOT ((OLD.status = 'PENDING' AND NEW.status IN ('APPROVED', 'REJECTED'))\n"
-                "                      OR (OLD.status = 'APPROVED' AND NEW.status = 'EXECUTED'))",
-                "WHEN OLD.status != 'PENDING' OR NEW.status NOT IN ('APPROVED', 'REJECTED')",
-            ))
+            if legacy_version == 'pre_execution':
+                trigger = trigger.replace(
+                    "WHEN NOT ((OLD.status = 'PENDING' AND NEW.status IN ('APPROVED', 'REJECTED'))\n"
+                    "                      OR (OLD.status = 'APPROVED' AND NEW.status = 'EXECUTED'))",
+                    "WHEN OLD.status != 'PENDING' OR NEW.status NOT IN ('APPROVED', 'REJECTED')",
+                )
+            connection.execute(trigger)
         proposals = SQLiteProposalRepository(connection)
         pending, approved, rejected = candidate(), candidate(), candidate()
         for proposal in (pending, approved, rejected):
@@ -342,17 +348,24 @@ def test_pre_execution_migration_preserves_approvals(tmp_path, rollback, foreign
         assert connection.execute('PRAGMA legacy_alter_table').fetchone()[0] == 0
         for proposal in (pending, approved, rejected):
             assert proposals.load(proposal.proposal_id) == proposal
+            assert proposals.load(proposal.proposal_id).origin is ProposalOrigin.MANUAL
         assert SQLiteApprovalRepository(connection).load(approved.proposal_id) == approval
         assert connection.execute(
             "SELECT name, sql FROM sqlite_master WHERE tbl_name = 'human_approvals' ORDER BY name"
         ).fetchall() == approval_schema
         assert connection.execute('PRAGMA foreign_key_check').fetchall() == []
         proposals.mark_executed(approved.proposal_id)
+        ai_terms = dict(portfolio_id='one', side=TradeSide.BUY, symbol='AAPL',
+                        quantity=1, price=Decimal('1.00'), rationale='AI suggestion')
+        AIProposalService(proposals).create(**ai_terms)
         if rollback:
             connection.rollback()
             assert proposals.load(approved.proposal_id) == approved
+            if legacy_version == 'pre_execution':
+                with pytest.raises(sqlite3.IntegrityError):
+                    proposals.mark_executed(approved.proposal_id)
             with pytest.raises(sqlite3.IntegrityError):
-                proposals.mark_executed(approved.proposal_id)
+                AIProposalService(proposals).create(**ai_terms)
             proposals.initialize_schema()
             proposals.mark_executed(approved.proposal_id)
         else:
@@ -364,6 +377,9 @@ def test_pre_execution_migration_preserves_approvals(tmp_path, rollback, foreign
         assert connection.execute('PRAGMA foreign_key_check').fetchall() == []
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute("UPDATE trade_proposals SET symbol = 'changed'")
+        connection.rollback()
+        with sqlite3.connect(tmp_path / 'approved-legacy.sqlite') as reopened:
+            assert SQLiteProposalRepository(reopened).load(pending.proposal_id).origin is ProposalOrigin.MANUAL
     finally:
         connection.close()
 
