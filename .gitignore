@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+
+# Coverage
+.coverage
+htmlcov/
+
+# Environment / secrets
+.env
+.env.*
+
+# macOS
+.DS_Store
+
+# PyCharm
+.idea/

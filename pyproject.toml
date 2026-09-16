@@ -1,0 +1,13 @@
+[project]
+name = "monster-light"
+version = "0.1.0"
+description = "Deterministic portfolio domain for Monster Light"
+requires-python = ">=3.13"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
