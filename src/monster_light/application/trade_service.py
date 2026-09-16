@@ -6,7 +6,7 @@ from enum import Enum
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from monster_light.application.audit import AuditOrigin, AuditOutcome, TradeAudit
+from monster_light.application.audit import AuditOutcome, ExecutionAuditContext, TradeAudit
 from monster_light.domain.portfolio import Portfolio, PortfolioError
 from monster_light.infrastructure.sqlite_audit_repository import SQLiteAuditRepository
 from monster_light.infrastructure.sqlite_transaction import sqlite_savepoint
@@ -28,7 +28,7 @@ class TradeRequest:
 
 
 class TradeService:
-    """Validate and atomically persist direct trades and their evidence.
+    """Validate and atomically persist trades and their evidence.
 
     Callers own connection lifetime. A caller's outer transaction also owns the
     durability of audit evidence, including rejections. The savepoint provides
@@ -39,7 +39,9 @@ class TradeService:
     def __init__(self, repository: SQLitePortfolioRepository) -> None:
         self._repository = repository
 
-    def execute(self, request: TradeRequest) -> Portfolio:
+    def execute(
+        self, request: TradeRequest, *, audit_context: ExecutionAuditContext = ExecutionAuditContext(),
+    ) -> Portfolio:
         if not isinstance(request.portfolio_id, str) or not request.portfolio_id.strip():
             raise ValueError("Portfolio identifier must be a non-empty string")
         if not isinstance(request.side, TradeSide):
@@ -69,7 +71,9 @@ class TradeService:
             audit = TradeAudit(
                 audit_id=str(uuid4()),
                 timestamp=datetime.now(timezone.utc).isoformat(),
-                origin=AuditOrigin.DIRECT,
+                origin=audit_context.origin,
+                proposal_id=audit_context.proposal_id,
+                approval_id=audit_context.approval_id,
                 portfolio_id=request.portfolio_id,
                 side=request.side.value,
                 symbol=request.symbol if isinstance(request.symbol, str) else repr(request.symbol),

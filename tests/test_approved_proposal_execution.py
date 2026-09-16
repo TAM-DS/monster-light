@@ -14,7 +14,7 @@ from monster_light.application.proposal_execution import (
     ApprovedProposalExecutionService, HumanApprovalRequired,
 )
 from monster_light.application.trade_service import TradeRequest, TradeService, TradeSide
-from monster_light.domain.portfolio import InsufficientShares, Portfolio
+from monster_light.domain.portfolio import InsufficientCash, InsufficientShares, Portfolio
 from monster_light.infrastructure.sqlite_approval_repository import SQLiteApprovalRepository
 from monster_light.infrastructure.sqlite_audit_repository import SQLiteAuditRepository
 from monster_light.infrastructure.sqlite_proposal_repository import SQLiteProposalRepository
@@ -67,9 +67,9 @@ def test_success_and_reopen(database, monkeypatch, side, cash, shares):
     execute = TradeService.execute
     seen = []
 
-    def capture(self, request):
+    def capture(self, request, **kwargs):
         seen.append(request)
-        return execute(self, request)
+        return execute(self, request, **kwargs)
 
     monkeypatch.setattr(TradeService, 'execute', capture)
     result = service.execute(proposal.proposal_id)
@@ -80,7 +80,8 @@ def test_success_and_reopen(database, monkeypatch, side, cash, shares):
     assert result.positions == {'AAPL': shares}
     assert proposals.load(proposal.proposal_id) == replace(proposal, status=ProposalStatus.EXECUTED)
     row, = audits(connection)
-    assert (row['outcome'], row['reason_code'], row['origin']) == ('ACCEPTED', 'TradeExecuted', 'DIRECT')
+    assert (row['outcome'], row['reason_code'], row['origin']) == ('ACCEPTED', 'TradeExecuted', 'APPROVED_PROPOSAL')
+    assert (row['proposal_id'], row['approval_id']) == (proposal.proposal_id, approval.approval_id)
     assert (row['portfolio_id'], row['side'], row['symbol'], row['quantity'], row['price']) == (
         proposal.portfolio_id, side.value, proposal.symbol, '1', '10.2500')
     assert SQLiteApprovalRepository(connection).load(proposal.proposal_id) == approval
@@ -99,7 +100,8 @@ def test_success_and_reopen(database, monkeypatch, side, cash, shares):
         portfolio = SQLitePortfolioRepository(reopened).load(' one ')
         assert portfolio.cash == Decimal(cash)
         assert portfolio.positions == {'AAPL': shares}
-        assert reopened.execute('SELECT count(*) FROM trade_audits').fetchone()[0] == 1
+        assert reopened.execute('SELECT origin, proposal_id, approval_id FROM trade_audits').fetchone() == (
+            'APPROVED_PROPOSAL', proposal.proposal_id, approval.approval_id)
 
 
 @pytest.mark.parametrize('status', [ProposalStatus.PENDING, ProposalStatus.REJECTED])
@@ -138,9 +140,13 @@ def test_missing_approval_and_unknown_id(database, monkeypatch):
     assert_original(portfolios)
 
 
-def test_oversell_keeps_decision_and_rejected_audit(database, monkeypatch):
+@pytest.mark.parametrize('side,quantity,error', [
+    (TradeSide.SELL, 2, InsufficientShares),
+    (TradeSide.BUY, 100, InsufficientCash),
+])
+def test_rejection_keeps_decision_and_provenance(database, monkeypatch, side, quantity, error):
     path, connection, proposals, portfolios, service = database
-    proposal = candidate(proposals, side=TradeSide.SELL, quantity=2)
+    proposal = candidate(proposals, side=side, quantity=quantity)
     approval = ApprovalService(proposals).approve(proposal.proposal_id, 'Human')
     # The authoritative balance changes after the human decision.
     TradeService(portfolios).execute(TradeRequest(' one ', TradeSide.SELL, 'AAPL', 1, Decimal('1')))
@@ -148,15 +154,15 @@ def test_oversell_keeps_decision_and_rejected_audit(database, monkeypatch):
     errors = []
     original = TradeService.execute
 
-    def capture(self, request):
+    def capture(self, request, **kwargs):
         try:
-            return original(self, request)
-        except InsufficientShares as error:
-            errors.append(error)
+            return original(self, request, **kwargs)
+        except error as caught_error:
+            errors.append(caught_error)
             raise
 
     monkeypatch.setattr(TradeService, 'execute', capture)
-    with pytest.raises(InsufficientShares) as caught:
+    with pytest.raises(error) as caught:
         service.execute(proposal.proposal_id)
     assert caught.value is errors[0]
     assert proposals.load(proposal.proposal_id).status is ProposalStatus.APPROVED
@@ -165,10 +171,15 @@ def test_oversell_keeps_decision_and_rejected_audit(database, monkeypatch):
     assert (after.cash, after.positions) == (before.cash, before.positions)
     row = audits(connection)[-1]
     assert (row['outcome'], row['reason_code'], row['reason_message']) == (
-        'REJECTED', 'InsufficientShares', str(caught.value))
+        'REJECTED', error.__name__, str(caught.value))
+    assert (row['origin'], row['proposal_id'], row['approval_id']) == (
+        'APPROVED_PROPOSAL', proposal.proposal_id, approval.approval_id)
+    assert connection.execute('SELECT count(*) FROM human_approvals').fetchone()[0] == 1
     assert not connection.in_transaction
     with sqlite3.connect(path) as observer:
-        assert observer.execute("SELECT count(*) FROM trade_audits WHERE outcome = 'REJECTED'").fetchone()[0] == 1
+        assert observer.execute(
+            "SELECT origin, proposal_id, approval_id FROM trade_audits WHERE outcome = 'REJECTED'"
+        ).fetchone() == ('APPROVED_PROPOSAL', proposal.proposal_id, approval.approval_id)
 
 
 @pytest.mark.parametrize('after', [False, True])

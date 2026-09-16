@@ -1,5 +1,6 @@
 """Execute approved immutable terms through the existing trusted trade service."""
 
+from monster_light.application.audit import AuditOrigin, ExecutionAuditContext
 from monster_light.application.proposal import (
     ProposalAlreadyExecuted, ProposalNotApproved, ProposalStatus,
 )
@@ -36,14 +37,22 @@ class ApprovedProposalExecutionService:
                 raise ProposalNotApproved(proposal_id)
             approvals = SQLiteApprovalRepository(connection)
             approvals.initialize_schema()
-            if approvals.load(proposal_id) is None:
+            approval = approvals.load(proposal_id)
+            if approval is None:
                 raise HumanApprovalRequired(proposal_id)
             request = TradeRequest(
                 portfolio_id=proposal.portfolio_id, side=proposal.side,
                 symbol=proposal.symbol, quantity=proposal.quantity, price=proposal.price,
             )
             try:
-                portfolio = TradeService(SQLitePortfolioRepository(connection)).execute(request)
+                portfolio = TradeService(SQLitePortfolioRepository(connection)).execute(
+                    request,
+                    audit_context=ExecutionAuditContext(
+                        origin=AuditOrigin.APPROVED_PROPOSAL,
+                        proposal_id=proposal.proposal_id,
+                        approval_id=approval.approval_id,
+                    ),
+                )
             except (PortfolioError, PortfolioNotFound) as error:
                 rejection = error
             else:

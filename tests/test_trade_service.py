@@ -6,6 +6,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from monster_light.application.audit import AuditOrigin, ExecutionAuditContext
 from monster_light.application.trade_service import TradeRequest, TradeService, TradeSide
 from monster_light.domain.portfolio import (
     InsufficientCash, InsufficientShares, InvalidMoney, InvalidQuantity,
@@ -72,12 +73,14 @@ def test_trade_loads_authoritative_state_and_persists(
     (TradeSide.BUY, "AAPL", 1, Decimal("NaN"), InvalidMoney),
     (TradeSide.SELL, "AAPL", 1, Decimal("-1"), InvalidMoney),
 ])
-def test_domain_rejection_never_saves(database, monkeypatch, side, symbol, quantity, price, error):
+@pytest.mark.parametrize("context", [ExecutionAuditContext(), ExecutionAuditContext(
+    AuditOrigin.APPROVED_PROPOSAL, "unverified-proposal", "unverified-approval")])
+def test_domain_rejection_never_saves(database, monkeypatch, side, symbol, quantity, price, error, context):
     path, _, repository = database
     save = Mock(wraps=repository.save)
     monkeypatch.setattr(repository, "save", save)
     with pytest.raises(error):
-        TradeService(repository).execute(TradeRequest("one", side, symbol, quantity, price))
+        TradeService(repository).execute(TradeRequest("one", side, symbol, quantity, price), audit_context=context)
     save.assert_not_called()
     persisted = repository.load("one")
     assert persisted.cash == Decimal("80")
@@ -116,11 +119,13 @@ def test_invalid_identifier_rejected_before_repository_access(database, portfoli
 
 
 @pytest.mark.parametrize("side", ["BUY", "SELL", "HOLD", "buy", None, 1])
-def test_only_explicit_trade_sides_are_accepted(database, side):
+@pytest.mark.parametrize("context", [ExecutionAuditContext(), ExecutionAuditContext(
+    AuditOrigin.APPROVED_PROPOSAL, "unverified-proposal", "unverified-approval")])
+def test_only_explicit_trade_sides_are_accepted(database, side, context):
     _, _, repository = database
     observed = Mock(wraps=repository)
     with pytest.raises(ValueError, match="Trade side"):
-        TradeService(observed).execute(TradeRequest("one", side, "AAPL", 1, Decimal("1")))
+        TradeService(observed).execute(TradeRequest("one", side, "AAPL", 1, Decimal("1")), audit_context=context)
     assert observed.mock_calls == []
 
 
