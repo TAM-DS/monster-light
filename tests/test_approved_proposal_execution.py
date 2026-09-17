@@ -1,6 +1,8 @@
 """Approval gates execution; authoritative validation and atomicity still apply."""
 
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from dataclasses import replace
 from decimal import Decimal
 from datetime import datetime, timedelta, timezone
@@ -15,7 +17,8 @@ import pytest
 
 from monster_light.application.approval import ApprovalService
 from monster_light.application.proposal import (
-    ProposalAlreadyExecuted, ProposalNotApproved, ProposalNotFound, ProposalStatus, TradeProposal,
+    ProposalAlreadyExecuted, ProposalNotApproved, ProposalNotFound, ProposalOrigin,
+    ProposalStatus, TradeProposal,
 )
 from monster_light.application.proposal_execution import (
     ApprovedProposalExecutionService, HumanApprovalRequired,
@@ -77,7 +80,8 @@ def assert_original(portfolios):
 ])
 def test_success_and_reopen(database, monkeypatch, side, cash, shares):
     path, connection, proposals, portfolios, service = database
-    proposal = candidate(proposals, side=side)
+    proposal = candidate(proposals, side=side, origin=ProposalOrigin.AI,
+                         grounding_evidence_id='evidence')
     approval = ApprovalService(proposals).approve(proposal.proposal_id, 'Human')
     execute = TradeService.execute
     seen = []
@@ -107,6 +111,9 @@ def test_success_and_reopen(database, monkeypatch, side, cash, shares):
     with pytest.raises(ProposalAlreadyExecuted):
         service.execute(proposal.proposal_id, 'evidence')
     assert [tuple(row) for row in audits(connection)] == [before]
+    assert proposals.load(proposal.proposal_id) == replace(proposal, status=ProposalStatus.EXECUTED)
+    assert portfolios.load(' one ').cash == Decimal(cash)
+    assert portfolios.load(' one ').positions == {'AAPL': shares}
     connection.close()
     with sqlite3.connect(path) as reopened:
         restored = SQLiteProposalRepository(reopened)
@@ -117,6 +124,113 @@ def test_success_and_reopen(database, monkeypatch, side, cash, shares):
         assert portfolio.cash == Decimal(cash)
         assert portfolio.positions == {'AAPL': shares}
         assert reopened.execute('SELECT origin, proposal_id, approval_id, market_evidence_id FROM trade_audits').fetchone() == (
+            'APPROVED_PROPOSAL', proposal.proposal_id, approval.approval_id, 'evidence')
+
+
+@pytest.mark.parametrize('journal_mode', ['DELETE', 'WAL'])
+@pytest.mark.parametrize('outer', [False, True])
+def test_concurrent_duplicate_has_one_success(database, journal_mode, outer):
+    path, connection, proposals, _, _ = database
+    assert connection.execute(f'PRAGMA journal_mode = {journal_mode}').fetchone()[0].upper() == journal_mode
+    proposal = candidate(proposals, origin=ProposalOrigin.AI, grounding_evidence_id='evidence')
+    approval = ApprovalService(proposals).approve(proposal.proposal_id, 'Human')
+    both_read_approved = Barrier(2, timeout=10)
+
+    class CoordinatedRepository(SQLiteProposalRepository):
+        first_read = True
+
+        def load(self, proposal_id):
+            result = super().load(proposal_id)
+            if self.first_read:
+                self.first_read = False
+                assert result.status is ProposalStatus.APPROVED
+                assert self.connection.in_transaction
+                # Both real connections retain an APPROVED read snapshot before
+                # either proceeds to the unchanged production execution path.
+                both_read_approved.wait()
+            return result
+
+    def attempt():
+        worker = sqlite3.connect(path, timeout=5)
+        try:
+            worker.execute('PRAGMA foreign_keys = ON')
+            if outer:
+                worker.execute('BEGIN')
+            service = ApprovedProposalExecutionService(
+                CoordinatedRepository(worker), maximum_age=timedelta(minutes=5), clock=lambda: NOW,
+            )
+            try:
+                result = service.execute(proposal.proposal_id, 'evidence')
+            except sqlite3.OperationalError as error:
+                # Do not accept unrelated failures or retry contention away.
+                assert error.sqlite_errorcode & 0xFF == sqlite3.SQLITE_BUSY
+                assert worker.in_transaction is outer
+                worker.rollback()
+                return error
+            assert worker.in_transaction is outer
+            worker.commit()
+            assert result.cash == Decimal('69.7500')
+            assert result.positions == {'AAPL': 3}
+            return None
+        finally:
+            worker.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(attempt) for _ in range(2)]
+        outcomes = [future.result(timeout=20) for future in futures]
+    assert sum(outcome is None for outcome in outcomes) == 1
+    assert sum(isinstance(outcome, sqlite3.OperationalError) for outcome in outcomes) == 1
+    # Verify committed consequences independently of either worker connection.
+    with sqlite3.connect(path) as observer:
+        observer.row_factory = sqlite3.Row
+        portfolio = SQLitePortfolioRepository(observer).load(' one ')
+        assert portfolio.cash == Decimal('69.7500')
+        assert portfolio.positions == {'AAPL': 3}
+        assert SQLiteProposalRepository(observer).load(proposal.proposal_id) == replace(
+            proposal, status=ProposalStatus.EXECUTED)
+        assert SQLiteApprovalRepository(observer).load(proposal.proposal_id) == approval
+        row, = audits(observer)
+        assert (row['outcome'], row['origin'], row['proposal_id'], row['approval_id'],
+                row['market_evidence_id']) == (
+            'ACCEPTED', 'APPROVED_PROPOSAL', proposal.proposal_id, approval.approval_id, 'evidence')
+        assert (row['cash_before'], row['cash_after'], row['quantity_before'], row['quantity_after']) == (
+            '80.000', '69.7500', 2, 3)
+
+
+def test_rejected_execution_can_succeed_after_prerequisite_changes(database):
+    path, connection, proposals, portfolios, service = database
+    proposal = candidate(proposals, quantity=8, origin=ProposalOrigin.AI,
+                         grounding_evidence_id='evidence')
+    approval = ApprovalService(proposals).approve(proposal.proposal_id, 'Human')
+    with pytest.raises(InsufficientCash):
+        service.execute(proposal.proposal_id, 'evidence')
+    assert proposals.load(proposal.proposal_id) == replace(proposal, status=ProposalStatus.APPROVED)
+    assert_original(portfolios)
+    rejected, = audits(connection)
+    assert rejected['outcome'] == 'REJECTED'
+    assert rejected['reason_code'] == 'InsufficientCash'
+    assert (rejected['cash_before'], rejected['cash_after'],
+            rejected['quantity_before'], rejected['quantity_after']) == ('80.000', '80.000', 2, 2)
+    with sqlite3.connect(path) as observer:
+        assert tuple(audits(observer)[0]) == tuple(rejected)
+
+    # A legitimate funded snapshot changes the prerequisite, not the decision.
+    portfolios.save(' one ', Portfolio.restore(Decimal('100.000'), {'AAPL': 2}))
+    result = service.execute(proposal.proposal_id, 'evidence')
+    assert result.cash == Decimal('18.0000')
+    assert result.positions == {'AAPL': 10}
+    assert portfolios.load(' one ').cash == Decimal('18.0000')
+    assert portfolios.load(' one ').positions == {'AAPL': 10}
+    assert proposals.load(proposal.proposal_id) == replace(proposal, status=ProposalStatus.EXECUTED)
+    assert SQLiteApprovalRepository(connection).load(proposal.proposal_id) == approval
+    rows = audits(connection)
+    assert len(rows) == 2
+    assert tuple(next(row for row in rows if row['outcome'] == 'REJECTED')) == tuple(rejected)
+    accepted, = [row for row in rows if row['outcome'] == 'ACCEPTED']
+    assert (accepted['cash_before'], accepted['cash_after'],
+            accepted['quantity_before'], accepted['quantity_after']) == ('100.000', '18.0000', 2, 10)
+    for row in rows:
+        assert (row['origin'], row['proposal_id'], row['approval_id'], row['market_evidence_id']) == (
             'APPROVED_PROPOSAL', proposal.proposal_id, approval.approval_id, 'evidence')
 
 
