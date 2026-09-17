@@ -26,7 +26,8 @@ from monster_light.infrastructure.sqlite_repository import SQLitePortfolioReposi
 def terms(**changes):
     return dict(portfolio_id="one", side=TradeSide.SELL, symbol=" aApL \t",
                 quantity=500, price=Decimal("123.4567890123456789012345678900"),
-                rationale=" AI suggests selling; unverified. \n") | changes
+                rationale=" AI suggests selling; unverified. \n",
+                grounding_evidence_id=" exact-grounding-id \t") | changes
 
 
 @pytest.fixture
@@ -62,7 +63,7 @@ def test_ai_pending_exact_terms_and_reopen(database):
 
 
 @pytest.mark.parametrize("field,value", [
-    *[(field, value) for field in ("portfolio_id", "symbol", "rationale")
+    *[(field, value) for field in ("portfolio_id", "symbol", "rationale", "grounding_evidence_id")
       for value in ("", " \t", None, 7)],
     *[("quantity", value) for value in (0, -1, True, False, 1.5, "1", None)],
     *[("price", value) for value in (
@@ -156,6 +157,7 @@ def test_ai_origin_does_not_authorize_execution(database):
     ("origin", ProposalOrigin.MANUAL), ("portfolio_id", "other"),
     ("side", TradeSide.BUY), ("symbol", "MSFT"), ("quantity", 1),
     ("price", Decimal("1")), ("rationale", "changed"),
+    ("grounding_evidence_id", "replacement"),
 ])
 def test_ai_terms_are_immutable(database, field, value):
     _, connection, repository = database
@@ -167,3 +169,12 @@ def test_ai_terms_are_immutable(database, field, value):
     with pytest.raises(sqlite3.IntegrityError):
         repository.save(replace(proposal, rationale="Changed terms"))
     assert repository.load(proposal.proposal_id) == proposal
+
+
+def test_grounding_argument_is_required(database):
+    _, connection, repository = database
+    inputs = terms()
+    del inputs['grounding_evidence_id']
+    with pytest.raises(TypeError, match='grounding_evidence_id'):
+        AIProposalService(repository).create(**inputs)
+    assert connection.execute('SELECT count(*) FROM trade_proposals').fetchone()[0] == 0

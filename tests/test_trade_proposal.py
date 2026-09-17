@@ -41,6 +41,7 @@ def test_round_trip_and_reopen(database):
     repository.save(proposal)
     assert repository.load(proposal.proposal_id) == proposal
     assert proposal.created_at.utcoffset() == timedelta(0)
+    assert proposal.grounding_evidence_id is None
     assert proposal.origin is ProposalOrigin.MANUAL
     assert proposal.status is ProposalStatus.PENDING
     assert connection.execute("SELECT price, typeof(price), symbol FROM trade_proposals").fetchone() == (
@@ -269,8 +270,14 @@ def test_legacy_schema_migration_preserves_history_and_transaction(tmp_path, rol
         """)
         repository = SQLiteProposalRepository(connection)
         pending, rejected = candidate(), candidate()
-        repository.save(pending)
-        repository.save(rejected)
+        for proposal in (pending, rejected):
+            connection.execute(
+                "INSERT INTO trade_proposals VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (proposal.proposal_id, proposal.created_at.isoformat(), proposal.origin.value,
+                 proposal.portfolio_id, proposal.side.value, proposal.symbol, proposal.quantity,
+                 str(proposal.price), proposal.rationale, proposal.status.value, None),
+            )
+        connection.commit()
         rejected = repository.reject(rejected.proposal_id, 'Not suitable')
         connection.execute('BEGIN')
         repository.initialize_schema()
@@ -356,7 +363,8 @@ def test_legacy_migration_preserves_approvals(tmp_path, rollback, foreign_keys, 
         assert connection.execute('PRAGMA foreign_key_check').fetchall() == []
         proposals.mark_executed(approved.proposal_id)
         ai_terms = dict(portfolio_id='one', side=TradeSide.BUY, symbol='AAPL',
-                        quantity=1, price=Decimal('1.00'), rationale='AI suggestion')
+                        quantity=1, price=Decimal('1.00'), rationale='AI suggestion',
+                        grounding_evidence_id='grounding')
         AIProposalService(proposals).create(**ai_terms)
         if rollback:
             connection.rollback()
@@ -410,3 +418,111 @@ def test_mark_executed_guards_and_terminal_state(database):
         with pytest.raises(ProposalAlreadyExecuted):
             operation()
     assert repository.load(approved.proposal_id) == executed
+
+
+def test_new_ai_write_requires_grounding_but_historical_shape_is_readable(database):
+    _, connection, repository = database
+    historical = candidate(origin=ProposalOrigin.AI)
+    assert historical.grounding_evidence_id is None
+    with pytest.raises(ValueError, match='grounding_evidence_id'):
+        repository.save(historical)
+    assert connection.execute('SELECT count(*) FROM trade_proposals').fetchone()[0] == 0
+
+
+@pytest.mark.parametrize('value', ['', ' \t\n', 7, False])
+def test_ai_grounding_must_be_nonempty_string(value):
+    with pytest.raises(ValueError, match='grounding_evidence_id'):
+        candidate(origin=ProposalOrigin.AI, grounding_evidence_id=value)
+
+
+def test_manual_cannot_claim_grounding(database):
+    _, _, repository = database
+    with pytest.raises(ValueError, match='MANUAL'):
+        candidate(grounding_evidence_id='claimed')
+    # The new-write boundary also rejects a bypassed dataclass constructor.
+    proposal = candidate()
+    object.__setattr__(proposal, 'grounding_evidence_id', 'claimed')
+    with pytest.raises(ValueError, match='MANUAL'):
+        repository.save(proposal)
+
+
+@pytest.mark.parametrize('replacement', [None, 'different-evidence'])
+def test_grounding_cannot_change_even_with_valid_status_transition(database, replacement):
+    _, connection, repository = database
+    proposal = candidate(origin=ProposalOrigin.AI, grounding_evidence_id='original')
+    repository.save(proposal)
+    with pytest.raises(sqlite3.IntegrityError, match='immutable'):
+        connection.execute(
+            "UPDATE trade_proposals SET grounding_evidence_id = ?, status = 'APPROVED'",
+            (replacement,),
+        )
+    if replacement is not None:
+        with pytest.raises(sqlite3.IntegrityError):
+            repository.save(replace(proposal, grounding_evidence_id=replacement))
+        with pytest.raises(sqlite3.IntegrityError, match='replaced'):
+            connection.execute(
+                "INSERT OR REPLACE INTO trade_proposals SELECT proposal_id, created_at, "
+                "origin, portfolio_id, side, symbol, quantity, price, rationale, status, "
+                "rejection_reason, ? FROM trade_proposals", (replacement,),
+            )
+    assert repository.load(proposal.proposal_id) == proposal
+
+
+@pytest.mark.parametrize('rollback', [False, True])
+def test_pre_grounding_ai_and_manual_migrate_honestly(tmp_path, rollback):
+    from monster_light.application.approval import ApprovalService
+    from monster_light.infrastructure.sqlite_approval_repository import SQLiteApprovalRepository
+
+    path = tmp_path / 'pre-grounding.sqlite'
+    with sqlite3.connect(':memory:') as template:
+        SQLiteProposalRepository(template).initialize_schema()
+        table = template.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'trade_proposals'"
+        ).fetchone()[0].replace('grounding_evidence_id TEXT,', '')
+        triggers = template.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'trade_proposals'"
+        ).fetchall()
+    with sqlite3.connect(path) as connection:
+        connection.execute('PRAGMA foreign_keys = ON')
+        connection.execute(table)
+        for (trigger,) in triggers:
+            connection.execute(trigger.replace(', grounding_evidence_id ON', ' ON'))
+        proposals = [candidate(origin=origin) for origin in ProposalOrigin]
+        for proposal in proposals:
+            connection.execute(
+                'INSERT INTO trade_proposals VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                (proposal.proposal_id, proposal.created_at.isoformat(), proposal.origin.value,
+                 proposal.portfolio_id, proposal.side.value, proposal.symbol, proposal.quantity,
+                 str(proposal.price), proposal.rationale, proposal.status.value, None),
+            )
+        connection.commit()
+        repository = SQLiteProposalRepository(connection)
+        approval = ApprovalService(repository).approve(proposals[1].proposal_id, 'Human')
+        proposals[1] = replace(proposals[1], status=ProposalStatus.APPROVED)
+        connection.execute('BEGIN')
+        repository.initialize_schema()
+        if rollback:
+            connection.rollback()
+            assert 'grounding_evidence_id' not in {
+                row[1] for row in connection.execute('PRAGMA table_info(trade_proposals)')
+            }
+            repository.initialize_schema()
+        repository.initialize_schema()
+        assert repository.list_for_portfolio('one') == sorted(
+            proposals, key=lambda proposal: (proposal.created_at, proposal.proposal_id),
+        )
+        assert connection.execute(
+            'SELECT grounding_evidence_id FROM trade_proposals'
+        ).fetchall() == [(None,), (None,)]
+        assert SQLiteApprovalRepository(connection).load(proposals[1].proposal_id) == approval
+        with pytest.raises(sqlite3.IntegrityError, match='immutable'):
+            connection.execute(
+                "UPDATE trade_proposals SET grounding_evidence_id = 'fabricated', "
+                "status = 'EXECUTED' WHERE origin = 'AI'"
+            )
+        repository.mark_executed(proposals[1].proposal_id)
+        assert connection.execute('PRAGMA foreign_key_check').fetchall() == []
+    with sqlite3.connect(path) as reopened:
+        repository = SQLiteProposalRepository(reopened)
+        for proposal in proposals:
+            assert repository.load(proposal.proposal_id).grounding_evidence_id is None

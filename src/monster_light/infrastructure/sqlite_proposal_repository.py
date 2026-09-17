@@ -28,6 +28,18 @@ class SQLiteProposalRepository:
             schema = self.connection.execute(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'trade_proposals'"
             ).fetchone()
+            if schema is not None:
+                columns = {row[1] for row in self.connection.execute(
+                    "PRAGMA table_info(trade_proposals)"
+                )}
+                if "grounding_evidence_id" not in columns:
+                    # Existing provenance is unknown; never manufacture an ID.
+                    self.connection.execute(
+                        "ALTER TABLE trade_proposals ADD COLUMN grounding_evidence_id TEXT"
+                    )
+                    self.connection.execute(
+                        "DROP TRIGGER IF EXISTS trade_proposals_immutable_terms"
+                    )
             # Rebuild the parent without renaming it: approval references and
             # triggers must continue to name trade_proposals.
             legacy = schema is not None and (
@@ -75,6 +87,7 @@ class SQLiteProposalRepository:
                 rationale TEXT NOT NULL,
                 status TEXT NOT NULL CHECK (status IN ('PENDING', 'APPROVED', 'REJECTED', 'EXECUTED')),
                 rejection_reason TEXT,
+                grounding_evidence_id TEXT,
                 CHECK ((status IN ('PENDING', 'APPROVED', 'EXECUTED') AND rejection_reason IS NULL) OR
                        (status = 'REJECTED' AND rejection_reason IS NOT NULL
                         AND length(trim(rejection_reason)) > 0))
@@ -86,7 +99,7 @@ class SQLiteProposalRepository:
         self.connection.execute("""
             CREATE TRIGGER IF NOT EXISTS trade_proposals_immutable_terms
             BEFORE UPDATE OF proposal_id, created_at, origin, portfolio_id,
-                side, symbol, quantity, price, rationale ON trade_proposals
+                side, symbol, quantity, price, rationale, grounding_evidence_id ON trade_proposals
             BEGIN SELECT RAISE(ABORT, 'Proposal terms are immutable'); END
         """)
         self.connection.execute("""
@@ -114,16 +127,22 @@ class SQLiteProposalRepository:
             raise ValueError("proposal must be a TradeProposal")
         if proposal.status is not ProposalStatus.PENDING:
             raise ValueError("New proposals must be PENDING")
+        if proposal.origin is ProposalOrigin.AI:
+            if (not isinstance(proposal.grounding_evidence_id, str)
+                    or not proposal.grounding_evidence_id.strip()):
+                raise ValueError("grounding_evidence_id must be a non-empty string")
+        elif proposal.grounding_evidence_id is not None:
+            raise ValueError("MANUAL proposals cannot claim grounding_evidence_id")
         with sqlite_savepoint(self.connection):
             self.connection.execute("""
                 INSERT INTO trade_proposals
                     (proposal_id, created_at, origin, portfolio_id, side, symbol,
-                     quantity, price, rationale, status, rejection_reason)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     quantity, price, rationale, status, rejection_reason, grounding_evidence_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (proposal.proposal_id, proposal.created_at.isoformat(), proposal.origin.value,
                   proposal.portfolio_id, proposal.side.value, proposal.symbol,
                   proposal.quantity, str(proposal.price), proposal.rationale,
-                  proposal.status.value, proposal.rejection_reason))
+                  proposal.status.value, proposal.rejection_reason, proposal.grounding_evidence_id))
 
     @staticmethod
     def _restore(row) -> TradeProposal:
@@ -132,6 +151,7 @@ class SQLiteProposalRepository:
             origin=ProposalOrigin(row[2]), portfolio_id=row[3], side=TradeSide(row[4]),
             symbol=row[5], quantity=row[6], price=Decimal(row[7]), rationale=row[8],
             status=ProposalStatus(row[9]), rejection_reason=row[10],
+            grounding_evidence_id=row[11] if len(row) > 11 else None,
         )
 
     def load(self, proposal_id: str) -> TradeProposal:

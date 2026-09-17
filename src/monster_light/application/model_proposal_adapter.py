@@ -79,4 +79,5 @@ class ModelProposalAdapter:
         return self._proposal_service.create(
             portfolio_id=candidate.portfolio_id, side=side, symbol=candidate.symbol,
             quantity=candidate.quantity, price=price, rationale=candidate.rationale,
+            grounding_evidence_id=evidence.evidence_id,
         )

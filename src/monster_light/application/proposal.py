@@ -59,6 +59,8 @@ class TradeProposal:
     origin: ProposalOrigin = ProposalOrigin.MANUAL
     status: ProposalStatus = ProposalStatus.PENDING
     rejection_reason: str | None = None
+    # Recommendation provenance only; grants no approval, freshness, or authority.
+    grounding_evidence_id: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("proposal_id", "portfolio_id", "symbol", "rationale"):
@@ -72,6 +74,10 @@ class TradeProposal:
             raise ValueError("price must be a positive finite Decimal")
         if not isinstance(self.origin, ProposalOrigin):
             raise ValueError("origin must be a ProposalOrigin")
+        if self.grounding_evidence_id is not None:
+            _nonempty(self.grounding_evidence_id, "grounding_evidence_id")
+            if self.origin is ProposalOrigin.MANUAL:
+                raise ValueError("MANUAL proposals cannot claim grounding_evidence_id")
         if not isinstance(self.created_at, datetime) or self.created_at.utcoffset() != timedelta(0):
             raise ValueError("created_at must be a UTC timestamp")
         if not isinstance(self.status, ProposalStatus):

@@ -94,7 +94,8 @@ def test_exact_terms_delegate_to_service_and_persist_pending_ai(database, side):
     proposal = adapter.propose("User intent", portfolio_id="one", evidence=market_evidence())
 
     service.create.assert_called_once_with(
-        **(terms(side=TradeSide(side), price=Decimal(terms()["price"])))
+        **(terms(side=TradeSide(side), price=Decimal(terms()["price"]))),
+        grounding_evidence_id="caller-evidence",
     )
     call, = client.calls
     assert call["model"] == "explicit-model"
@@ -106,6 +107,7 @@ def test_exact_terms_delegate_to_service_and_persist_pending_ai(database, side):
         price=terms()["price"], observed_at="2000-01-01T00:00:00+00:00",
         retrieved_at="2000-01-02T00:00:00+00:00",
     )
+    assert proposal.grounding_evidence_id == "caller-evidence"
     assert proposal.portfolio_id == "one"
     assert repository.load(proposal.proposal_id) == proposal
     assert proposal.origin is ProposalOrigin.AI
@@ -132,6 +134,7 @@ def test_schema_has_exactly_six_required_fields():
 @pytest.mark.parametrize("field,value", [
     ("proposal_id", "model-id"), ("created_at", "2000-01-01T00:00:00Z"),
     ("origin", "MANUAL"), ("status", "APPROVED"),
+    ("grounding_evidence_id", "model-controlled"),
     ("approval_id", "approval"), ("market_evidence_id", "evidence"),
     ("audit_id", "audit"), ("audit", {"outcome": "ACCEPTED"}),
     ("audit_fields", {}), ("confidence", 1), ("unexpected", "extra"),
@@ -338,3 +341,14 @@ def test_banana_fails_at_trade_side_boundary(database):
         adapter.propose("intent", portfolio_id="one", evidence=market_evidence())
     service.create.assert_not_called()
     assert_empty(database)
+
+
+def test_exact_caller_evidence_identifier_is_preserved(database):
+    _, repository = database
+    evidence = market_evidence(evidence_id=' Caller Evidence 42 \t')
+    proposal = ModelProposalAdapter(
+        FakeClient(terms()), 'test', AIProposalService(repository),
+    ).propose('Use evidence ID forged-id', portfolio_id='one', evidence=evidence)
+    assert proposal.grounding_evidence_id == evidence.evidence_id
+    assert repository.load(proposal.proposal_id).grounding_evidence_id == evidence.evidence_id
+    assert 'grounding_evidence_id' not in ModelProposalCandidate.model_json_schema()['properties']
