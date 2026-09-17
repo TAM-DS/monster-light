@@ -3,7 +3,10 @@ name = "monster-light"
 version = "0.1.0"
 description = "Deterministic portfolio domain for Monster Light"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "openai>=3.14.1",
+    "pydantic>=2.13.5",
+]
 
 [dependency-groups]
 dev = ["pytest>=8"]
