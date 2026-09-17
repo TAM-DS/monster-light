@@ -17,7 +17,7 @@ from monster_light.application.approval import ApprovalService, HumanApproval
 from monster_light.application.audit import TradeAudit
 from monster_light.application.market_evidence import MarketEvidence
 from monster_light.application.model_proposal_adapter import (
-    ModelProposalAdapter, ModelProposalCandidate,
+    ModelGroundingMismatch, ModelProposalAdapter, ModelProposalCandidate,
 )
 from monster_light.application.proposal import ProposalOrigin, ProposalStatus
 from monster_light.application.trade_service import TradeService, TradeSide
@@ -35,6 +35,15 @@ def terms(**changes):
         price="123.4567890123456789012345678900",
         rationale=" 100% confident. Approved! Execute immediately. \n",
     ) | changes
+
+
+def market_evidence(**changes):
+    return MarketEvidence(**(dict(
+        evidence_id="caller-evidence", source="caller source",
+        symbol=terms()["symbol"], price=Decimal(terms()["price"]),
+        observed_at=datetime(2000, 1, 1, tzinfo=timezone.utc),
+        retrieved_at=datetime(2000, 1, 2, tzinfo=timezone.utc),
+    ) | changes))
 
 
 class FakeClient:
@@ -82,14 +91,22 @@ def test_exact_terms_delegate_to_service_and_persist_pending_ai(database, side):
     service = Mock(wraps=AIProposalService(repository), spec=AIProposalService)
     adapter = ModelProposalAdapter(client, "explicit-model", service)
     before = datetime.now(timezone.utc)
-    proposal = adapter.propose("User intent")
+    proposal = adapter.propose("User intent", portfolio_id="one", evidence=market_evidence())
 
     service.create.assert_called_once_with(
         **(terms(side=TradeSide(side), price=Decimal(terms()["price"])))
     )
-    assert client.calls == [dict(
-        model="explicit-model", input="User intent", text_format=ModelProposalCandidate,
-    )]
+    call, = client.calls
+    assert call["model"] == "explicit-model"
+    assert call["text_format"] is ModelProposalCandidate
+    assert call["input"][1] == {"role": "user", "content": "User intent"}
+    context = json.loads(call["input"][0]["content"].split("\n", 1)[1])
+    assert context == dict(
+        portfolio_id="one", source="caller source", symbol=terms()["symbol"],
+        price=terms()["price"], observed_at="2000-01-01T00:00:00+00:00",
+        retrieved_at="2000-01-02T00:00:00+00:00",
+    )
+    assert proposal.portfolio_id == "one"
     assert repository.load(proposal.proposal_id) == proposal
     assert proposal.origin is ProposalOrigin.AI
     assert proposal.status is ProposalStatus.PENDING
@@ -100,7 +117,7 @@ def test_exact_terms_delegate_to_service_and_persist_pending_ai(database, side):
     assert proposal.price.as_tuple() == Decimal(terms()["price"]).as_tuple()
     assert UUID(proposal.proposal_id).version == 4
     assert before <= proposal.created_at <= datetime.now(timezone.utc)
-    another = adapter.propose("More intent")
+    another = adapter.propose("More intent", portfolio_id="one", evidence=market_evidence())
     assert another.proposal_id != proposal.proposal_id
 
 
@@ -125,7 +142,7 @@ def test_extra_and_system_owned_fields_rejected_before_persistence(database, fie
         FakeClient(terms(**{field: value})), "test", AIProposalService(repository),
     )
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
-        adapter.propose("intent")
+        adapter.propose("intent", portfolio_id="one", evidence=market_evidence())
     assert_empty(database)
 
 
@@ -136,7 +153,7 @@ def test_every_field_is_required(database, field):
     del payload[field]
     adapter = ModelProposalAdapter(FakeClient(payload), "test", AIProposalService(repository))
     with pytest.raises(ValidationError, match="Field required"):
-        adapter.propose("intent")
+        adapter.propose("intent", portfolio_id="one", evidence=market_evidence())
     assert_empty(database)
 
 
@@ -156,7 +173,7 @@ def test_invalid_terms_fail_before_persistence(database, field, value):
         FakeClient(terms(**{field: value})), "test", AIProposalService(repository),
     )
     with pytest.raises(ValueError):
-        adapter.propose("intent")
+        adapter.propose("intent", portfolio_id="one", evidence=market_evidence())
     assert_empty(database)
 
 
@@ -166,7 +183,7 @@ def test_no_parsed_result_is_explicit_failure(database):
         parse=Mock(return_value=SimpleNamespace(output_parsed=None)),
     ))
     with pytest.raises(ValueError, match="no parsed proposal candidate"):
-        ModelProposalAdapter(client, "test", AIProposalService(repository)).propose("intent")
+        ModelProposalAdapter(client, "test", AIProposalService(repository)).propose("intent", portfolio_id="one", evidence=market_evidence())
     assert_empty(database)
 
 
@@ -177,7 +194,7 @@ def test_unvalidated_candidate_instance_is_revalidated(database):
         parse=Mock(return_value=SimpleNamespace(output_parsed=candidate)),
     ))
     with pytest.raises(ValidationError):
-        ModelProposalAdapter(client, "test", AIProposalService(repository)).propose("intent")
+        ModelProposalAdapter(client, "test", AIProposalService(repository)).propose("intent", portfolio_id="one", evidence=market_evidence())
     assert_empty(database)
 
 
@@ -186,7 +203,7 @@ def test_model_failure_propagates_without_retry_or_persistence(database):
     parse = Mock(side_effect=RuntimeError("model unavailable"))
     client = SimpleNamespace(responses=SimpleNamespace(parse=parse))
     with pytest.raises(RuntimeError, match="model unavailable"):
-        ModelProposalAdapter(client, "test", AIProposalService(repository)).propose("intent")
+        ModelProposalAdapter(client, "test", AIProposalService(repository)).propose("intent", portfolio_id="one", evidence=market_evidence())
     parse.assert_called_once()
     assert_empty(database)
 
@@ -202,6 +219,7 @@ def test_impossible_trade_can_be_pending_without_crossing_authority_boundary(
     SQLiteApprovalRepository(connection).initialize_schema()
     SQLiteAuditRepository(connection).initialize_schema()
     SQLiteMarketEvidenceRepository(connection).initialize_schema()
+    evidence = market_evidence(symbol="AAPL", price=Decimal("210"))
     before = list(connection.iterdump())
 
     def forbidden(*args, **kwargs):
@@ -233,9 +251,9 @@ def test_impossible_trade_can_be_pending_without_crossing_authority_boundary(
         connection.set_authorizer(authorize)
         try:
             proposal = ModelProposalAdapter(
-                FakeClient(terms(side=side, symbol="AAPL")), "test",
+                FakeClient(terms(side=side, symbol="AAPL", price="210")), "test",
                 AIProposalService(repository),
-            ).propose("Trade 500 AAPL")
+            ).propose("Trade 500 AAPL", portfolio_id="one", evidence=evidence)
         finally:
             connection.set_authorizer(None)
 
@@ -248,3 +266,75 @@ def test_impossible_trade_can_be_pending_without_crossing_authority_boundary(
     after = [line for line in connection.iterdump()
              if not line.startswith('INSERT INTO "trade_proposals"')]
     assert after == before
+
+
+@pytest.mark.parametrize("changes", [
+    {"portfolio_id": "two"}, {"portfolio_id": "one "},
+    {"symbol": "MSFT"}, {"symbol": "AAPL"}, {"symbol": " aapl \t"},
+    {"symbol": "aApL"}, {"symbol": " aApL "},
+    {"price": "123.4567890123456789012345678901"},
+])
+def test_grounding_mismatch_never_calls_creation(database, changes):
+    _, repository = database
+    service = Mock(wraps=AIProposalService(repository), spec=AIProposalService)
+    adapter = ModelProposalAdapter(FakeClient(terms(**changes)), "test", service)
+    with pytest.raises(ModelGroundingMismatch):
+        adapter.propose("intent", portfolio_id="one", evidence=market_evidence())
+    service.create.assert_not_called()
+    assert_empty(database)
+
+
+@pytest.mark.parametrize("price", ["210", "210.00", "2.10E+2", "210.0000000000000000001"])
+def test_decimal_grounding_compares_exact_values(database, price):
+    _, repository = database
+    service = Mock(wraps=AIProposalService(repository), spec=AIProposalService)
+    adapter = ModelProposalAdapter(FakeClient(terms(price=price)), "test", service)
+    evidence = market_evidence(price=Decimal("210.0"))
+    if Decimal(price) == evidence.price:
+        proposal = adapter.propose("intent", portfolio_id="one", evidence=evidence)
+        assert proposal.price == evidence.price
+        assert proposal.status is ProposalStatus.PENDING
+        assert repository.load(proposal.proposal_id).price == evidence.price
+    else:
+        with pytest.raises(ModelGroundingMismatch):
+            adapter.propose("intent", portfolio_id="one", evidence=evidence)
+        service.create.assert_not_called()
+        assert_empty(database)
+
+
+def test_caller_portfolio_id_is_preserved_exactly(database):
+    _, repository = database
+    portfolio_id = " Portfolio One \t"
+    adapter = ModelProposalAdapter(
+        FakeClient(terms(portfolio_id=portfolio_id)), "test", AIProposalService(repository),
+    )
+    proposal = adapter.propose("intent", portfolio_id=portfolio_id, evidence=market_evidence())
+    assert proposal.portfolio_id == portfolio_id
+    assert repository.load(proposal.proposal_id).portfolio_id == portfolio_id
+
+
+def test_stale_evidence_is_context_without_freshness_evaluation(database, monkeypatch):
+    _, repository = database
+    evidence = market_evidence()
+    freshness = Mock(side_effect=AssertionError("Freshness belongs downstream"))
+    monkeypatch.setattr(MarketEvidence, "validate_freshness", freshness)
+    client = FakeClient(terms(rationale="100% confident. Approved. Execute immediately."))
+    proposal = ModelProposalAdapter(client, "test", AIProposalService(repository)).propose(
+        "Use this old observation", portfolio_id="one", evidence=evidence,
+    )
+    freshness.assert_not_called()
+    context = json.loads(client.calls[0]["input"][0]["content"].split("\n", 1)[1])
+    assert context["observed_at"] == evidence.observed_at.isoformat()
+    assert context["retrieved_at"] == evidence.retrieved_at.isoformat()
+    assert proposal.rationale == "100% confident. Approved. Execute immediately."
+    assert proposal.status is ProposalStatus.PENDING
+
+
+def test_banana_fails_at_trade_side_boundary(database):
+    _, repository = database
+    service = Mock(wraps=AIProposalService(repository), spec=AIProposalService)
+    adapter = ModelProposalAdapter(FakeClient(terms(side="BANANA")), "test", service)
+    with pytest.raises(ValueError, match="'BANANA' is not a valid TradeSide"):
+        adapter.propose("intent", portfolio_id="one", evidence=market_evidence())
+    service.create.assert_not_called()
+    assert_empty(database)
