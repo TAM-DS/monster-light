@@ -21,14 +21,23 @@ Audit  -> RECORD EVIDENCE
 
 ## Governed workflow
 
-```text
-Trusted grounding evidence
-  -> AI proposal -> PENDING
-  -> human approval -> APPROVED
-  -> fresh execution evidence
-  -> deterministic validation
-  -> EXECUTED or REJECTED attempt
-  -> immutable audit evidence
+```mermaid
+flowchart TD
+    grounding["Trusted grounding evidence<br/>What informed the recommendation?"]
+    ai["ModelProposalAdapter / AIProposalService"]
+    pending["PENDING proposal"]
+    approval["Explicit human approval<br/>ApprovalService"]
+    approved["APPROVED proposal"]
+    evidence["Fresh execution evidence<br/>What did the system verify when action was attempted?"]
+    execution["ApprovedProposalExecutionService<br/>Verify approval and execution evidence"]
+    validation{"TradeService<br/>Deterministic portfolio checks"}
+    success["SUCCESS<br/>Portfolio mutation occurs<br/>Proposal becomes EXECUTED<br/>ACCEPTED audit: proposal_id, approval_id,<br/>execution evidence (market_evidence_id)"]
+    failure["FAILURE<br/>Portfolio unchanged<br/>Proposal remains APPROVED<br/>REJECTED audit: failed attempt and reason,<br/>proposal_id, approval_id,<br/>execution evidence (market_evidence_id)"]
+
+    grounding --> ai --> pending --> approval --> approved
+    approved --> evidence --> execution --> validation
+    validation -->|Pass| success
+    validation -->|Fail| failure
 ```
 
 Successful execution marks the proposal `EXECUTED` and records an `ACCEPTED` trade audit. A deterministic portfolio rejection records a `REJECTED` audit while leaving the proposal `APPROVED`. The attempt's outcome and the proposal's status are distinct.
