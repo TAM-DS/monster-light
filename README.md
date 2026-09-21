@@ -31,10 +31,20 @@ The Streamlit console exposes the authority model as an operator workflow rather
 3. **Verify fresh evidence and attempt execution** — fetch new execution evidence, require it to match the immutable approved terms and freshness policy, then apply authoritative portfolio rules.
 4. **Record evidence** — accepted and rejected consequential attempts are preserved in the append-only audit trail.
 
+### Visual evidence
+
+![Monster Light 2.0 live workflow showing human approval without execution authority](docs/images/monster-light-2-live-approval-boundary.webp)
+
+*Live approval boundary: the proposal is `APPROVED`, but the UI still requires fresh execution evidence and deterministic portfolio validation before any consequence can occur.*
+
 The console also presents paired deterministic proof cases:
 
 - **ALLOWED:** approval exists, evidence and portfolio checks pass, the proposal becomes `EXECUTED`, the audit is `ACCEPTED`, and the portfolio changes.
 - **BLOCKED:** approval exists, but current portfolio state fails validation with `InsufficientCash`; the audit is `REJECTED`, the portfolio remains unchanged, and the proposal remains `APPROVED`.
+
+![Monster Light 2.0 deterministic governance proof showing an allowed execution and an insufficient-cash rejection](docs/images/monster-light-2-governance-proof.webp)
+
+*Paired control proof: one approved trade passes current validation and records `ACCEPTED`; another approved trade is blocked by `InsufficientCash`, records `REJECTED`, and leaves portfolio state unchanged.*
 
 A live market-price mismatch is intentionally blocked before the trade service is reached. Human approval of one immutable price is not treated as blanket permission to execute at a different price.
 
