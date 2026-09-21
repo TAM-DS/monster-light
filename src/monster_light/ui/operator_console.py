@@ -189,17 +189,25 @@ def _render_live_workflow(connection: sqlite3.Connection) -> None:
 
     if st.button("1. Generate AI proposal", type="primary", width="stretch"):
         try:
-            grounding = YFinanceQuoteProvider().fetch(symbol)
-            evidence_repository.append(grounding)
-            with OpenAI(max_retries=0) as client:
-                proposal = ModelProposalAdapter(
-                    client,
-                    DEFAULT_MODEL,
-                    AIProposalService(proposals),
-                ).propose(
-                    instruction,
-                    portfolio_id=portfolio_id,
-                    evidence=grounding,
+            with st.status("Building governed proposal...", expanded=True) as status:
+                st.write("Fetching near-real-time market evidence...")
+                grounding = YFinanceQuoteProvider().fetch(symbol)
+                evidence_repository.append(grounding)
+                st.write("Market evidence recorded. Requesting structured AI proposal...")
+                with OpenAI(max_retries=0, timeout=30.0) as client:
+                    proposal = ModelProposalAdapter(
+                        client,
+                        DEFAULT_MODEL,
+                        AIProposalService(proposals),
+                    ).propose(
+                        instruction,
+                        portfolio_id=portfolio_id,
+                        evidence=grounding,
+                    )
+                status.update(
+                    label="Proposal recorded as PENDING",
+                    state="complete",
+                    expanded=False,
                 )
             st.session_state["proposal_id"] = proposal.proposal_id
             _record_event(
