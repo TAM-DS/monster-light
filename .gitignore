@@ -21,3 +21,6 @@ htmlcov/
 
 # PyCharm
 .idea/
+
+# Local Monster Light operator state
+.monster-light/
