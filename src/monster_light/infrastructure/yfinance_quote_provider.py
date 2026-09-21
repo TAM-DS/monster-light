@@ -57,6 +57,7 @@ class YFinanceQuoteProvider:
                 actions=False,
                 auto_adjust=False,
                 raise_errors=True,
+                timeout=10,
             )
         except Exception as error:
             raise MarketDataUnavailable(
