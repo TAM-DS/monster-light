@@ -42,10 +42,6 @@ The console also presents paired deterministic proof cases:
 - **ALLOWED:** approval exists, evidence and portfolio checks pass, the proposal becomes `EXECUTED`, the audit is `ACCEPTED`, and the portfolio changes.
 - **BLOCKED:** approval exists, but current portfolio state fails validation with `InsufficientCash`; the audit is `REJECTED`, the portfolio remains unchanged, and the proposal remains `APPROVED`.
 
-![Monster Light 2.0 deterministic governance proof showing an allowed execution and an insufficient-cash rejection](docs/images/monster-light-2-governance-proof.webp)
-
-*Paired control proof: one approved trade passes current validation and records `ACCEPTED`; another approved trade is blocked by `InsufficientCash`, records `REJECTED`, and leaves portfolio state unchanged.*
-
 A live market-price mismatch is intentionally blocked before the trade service is reached. Human approval of one immutable price is not treated as blanket permission to execute at a different price.
 
 ### Run the operator console
