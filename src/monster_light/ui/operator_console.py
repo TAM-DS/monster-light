@@ -282,7 +282,7 @@ def _render_live_workflow(connection: sqlite3.Connection) -> None:
                         detail=str(error),
                     )
                 st.session_state["active_tab"] = "Live workflow"
-            st.rerun()
+                st.rerun()
 
         with reject_column:
             rejection_reason = st.text_input(
@@ -305,7 +305,7 @@ def _render_live_workflow(connection: sqlite3.Connection) -> None:
                         detail=str(error),
                     )
                 st.session_state["active_tab"] = "Live workflow"
-            st.rerun()
+                st.rerun()
 
     elif proposal.status is ProposalStatus.APPROVED:
         st.info(
