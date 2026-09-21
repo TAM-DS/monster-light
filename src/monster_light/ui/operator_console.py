@@ -221,9 +221,11 @@ def _render_live_workflow(connection: sqlite3.Connection) -> None:
                 observed_at=grounding.observed_at.isoformat(),
                 retrieved_at=grounding.retrieved_at.isoformat(),
             )
+            st.session_state["active_tab"] = "Live workflow"
             st.rerun()
         except (MarketDataUnavailable, ValueError, RuntimeError) as error:
             _record_event("error", str(error))
+            st.session_state["active_tab"] = "Live workflow"
             st.rerun()
         except Exception as error:
             _record_event(
@@ -232,10 +234,12 @@ def _render_live_workflow(connection: sqlite3.Connection) -> None:
                 error_type=type(error).__name__,
                 detail=str(error),
             )
+            st.session_state["active_tab"] = "Live workflow"
             st.rerun()
 
     proposal = _proposal_for_session(proposals, portfolio_id)
     if proposal is None:
+        _render_event()
         st.info("No proposal exists for this portfolio yet.")
         return
 
@@ -277,7 +281,8 @@ def _render_live_workflow(connection: sqlite3.Connection) -> None:
                         error_type=type(error).__name__,
                         detail=str(error),
                     )
-                st.rerun()
+                st.session_state["active_tab"] = "Live workflow"
+            st.rerun()
 
         with reject_column:
             rejection_reason = st.text_input(
@@ -299,7 +304,8 @@ def _render_live_workflow(connection: sqlite3.Connection) -> None:
                         error_type=type(error).__name__,
                         detail=str(error),
                     )
-                st.rerun()
+                st.session_state["active_tab"] = "Live workflow"
+            st.rerun()
 
     elif proposal.status is ProposalStatus.APPROVED:
         st.info(
@@ -365,6 +371,7 @@ def _render_live_workflow(connection: sqlite3.Connection) -> None:
                     execution_evidence_id=fresh.evidence_id,
                     price=str(fresh.price),
                 )
+            st.session_state["active_tab"] = "Live workflow"
             st.rerun()
 
     elif proposal.status is ProposalStatus.EXECUTED:
@@ -373,6 +380,7 @@ def _render_live_workflow(connection: sqlite3.Connection) -> None:
     elif proposal.status is ProposalStatus.REJECTED:
         st.warning(f"Proposal rejected: {proposal.rejection_reason}")
 
+    _render_event()
     _render_recent_audit(connection, proposal.proposal_id)
 
 
@@ -404,53 +412,81 @@ def _render_recent_audit(
 
 
 def _render_governance_proof() -> None:
-    st.subheader("Insufficient-cash governance proof")
+    st.subheader("Deterministic governance proofs")
     st.write(
-        "This is the deterministic proof case from the governed core: an approved "
-        "AAPL purchase is attempted at USD 210 with only USD 100 in cash."
+        "The same governed execution path proves both outcomes: controls allow a "
+        "valid approved trade and block an approved trade that current portfolio "
+        "reality cannot support."
     )
 
-    if st.button("Run insufficient-cash proof", type="primary"):
+    if st.button("Run deterministic control proofs", type="primary"):
         with redirect_stdout(io.StringIO()):
-            _, failure = run_deterministic_demo()
-        st.session_state["cash_proof"] = {
-            "proposal_status_before": failure.before.status.value,
-            "proposal_status_after": failure.after.status.value,
-            "audit_outcome": failure.audit["outcome"],
-            "reason_code": failure.audit["reason_code"],
-            "cash_before": str(failure.portfolio_before.cash),
-            "cash_after": str(failure.portfolio_after.cash),
-            "quantity_before": failure.portfolio_before.quantity_for("AAPL"),
-            "quantity_after": failure.portfolio_after.quantity_for("AAPL"),
-            "proposal_id": failure.before.proposal_id,
-            "approval_id": failure.approval.approval_id,
-            "execution_evidence_id": failure.audit["market_evidence_id"],
+            success, failure = run_deterministic_demo()
+        st.session_state["control_proofs"] = {
+            "success": {
+                "proposal_status_before": success.before.status.value,
+                "proposal_status_after": success.after.status.value,
+                "audit_outcome": success.audit["outcome"],
+                "reason_code": success.audit["reason_code"],
+                "cash_before": str(success.portfolio_before.cash),
+                "cash_after": str(success.portfolio_after.cash),
+                "quantity_before": success.portfolio_before.quantity_for("AAPL"),
+                "quantity_after": success.portfolio_after.quantity_for("AAPL"),
+                "proposal_id": success.before.proposal_id,
+                "approval_id": success.approval.approval_id,
+                "execution_evidence_id": success.audit["market_evidence_id"],
+            },
+            "blocked": {
+                "proposal_status_before": failure.before.status.value,
+                "proposal_status_after": failure.after.status.value,
+                "audit_outcome": failure.audit["outcome"],
+                "reason_code": failure.audit["reason_code"],
+                "cash_before": str(failure.portfolio_before.cash),
+                "cash_after": str(failure.portfolio_after.cash),
+                "quantity_before": failure.portfolio_before.quantity_for("AAPL"),
+                "quantity_after": failure.portfolio_after.quantity_for("AAPL"),
+                "proposal_id": failure.before.proposal_id,
+                "approval_id": failure.approval.approval_id,
+                "execution_evidence_id": failure.audit["market_evidence_id"],
+            },
         }
+        st.session_state["active_tab"] = "Governance proof"
+        st.rerun()
 
-    proof = st.session_state.get("cash_proof")
-    if proof:
-        st.error("REJECTED — InsufficientCash")
-        columns = st.columns(4)
-        columns[0].metric(
-            "Proposal",
-            proof["proposal_status_after"],
-            help="The failed attempt does not erase human approval.",
-        )
-        columns[1].metric("Audit", proof["audit_outcome"])
-        columns[2].metric(
-            "Cash",
-            f"${Decimal(proof['cash_after']):,.2f}",
-        )
-        columns[3].metric(
-            "AAPL shares",
-            proof["quantity_after"],
-        )
+    proofs = st.session_state.get("control_proofs")
+    if not proofs:
+        return
+
+    allowed = proofs["success"]
+    blocked = proofs["blocked"]
+    allowed_column, blocked_column = st.columns(2)
+
+    with allowed_column:
+        st.success("ALLOWED — deterministic controls passed")
+        metrics = st.columns(2)
+        metrics[0].metric("Proposal", allowed["proposal_status_after"])
+        metrics[1].metric("Audit", allowed["audit_outcome"])
+        metrics[0].metric("Cash after", f"${Decimal(allowed['cash_after']):,.2f}")
+        metrics[1].metric("AAPL shares", allowed["quantity_after"])
         st.caption(
-            "Human approval was real evidence of authorization. It still could not "
-            "override authoritative portfolio state."
+            "Approval permitted an attempt; fresh evidence and portfolio validation "
+            "passed, so the governed consequence occurred."
         )
-        with st.expander("Proof evidence", expanded=True):
-            st.json(proof)
+
+    with blocked_column:
+        st.error("BLOCKED — InsufficientCash")
+        metrics = st.columns(2)
+        metrics[0].metric("Proposal", blocked["proposal_status_after"])
+        metrics[1].metric("Audit", blocked["audit_outcome"])
+        metrics[0].metric("Cash after", f"${Decimal(blocked['cash_after']):,.2f}")
+        metrics[1].metric("AAPL shares", blocked["quantity_after"])
+        st.caption(
+            "Approval remained historical truth, but authoritative portfolio state "
+            "prevented the consequence."
+        )
+
+    with st.expander("Control proof evidence", expanded=False):
+        st.json(proofs)
 
 
 def _render_evidence_view(connection: sqlite3.Connection) -> None:
@@ -485,12 +521,11 @@ def main() -> None:
     )
     st.title(APP_TITLE)
     _render_authority_model()
-    _render_event()
-
     connection = _open_database()
     try:
         live_tab, proof_tab, evidence_tab = st.tabs(
-            ["Live workflow", "Governance proof", "Evidence & audit"]
+            ["Live workflow", "Governance proof", "Evidence & audit"],
+            default=st.session_state.get("active_tab", "Live workflow"),
         )
         with live_tab:
             _render_live_workflow(connection)
