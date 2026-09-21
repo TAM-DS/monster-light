@@ -71,6 +71,7 @@ def test_fetch_returns_governance_evidence_without_authority():
         "actions": False,
         "auto_adjust": False,
         "raise_errors": True,
+        "timeout": 10,
     }]
 
 
