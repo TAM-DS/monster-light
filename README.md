@@ -36,7 +36,7 @@ The console also presents paired deterministic proof cases:
 - **ALLOWED:** approval exists, evidence and portfolio checks pass, the proposal becomes `EXECUTED`, the audit is `ACCEPTED`, and the portfolio changes.
 - **BLOCKED:** approval exists, but current portfolio state fails validation with `InsufficientCash`; the audit is `REJECTED`, the portfolio remains unchanged, and the proposal remains `APPROVED`.
 
-![Monster Light 2.0 Streamlit governance proof showing an allowed execution and an insufficient-cash rejection](docs/images/monster-light-2-governance-proof.jpg)
+![Monster Light 2.0 Streamlit governance proof showing an allowed execution and an insufficient-cash rejection](docs/images/monster-light-2-governance-proof.png)
 
 *The operator console makes both sides of the control boundary visible: valid authorization plus current evidence can produce a consequence, while authorization alone cannot override authoritative portfolio state.*
 
