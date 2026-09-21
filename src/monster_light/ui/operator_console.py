@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import io
 import os
 import sqlite3
+from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -185,7 +187,7 @@ def _render_live_workflow(connection: sqlite3.Connection) -> None:
         height=100,
     )
 
-    if st.button("1. Generate AI proposal", type="primary", use_container_width=True):
+    if st.button("1. Generate AI proposal", type="primary", width="stretch"):
         try:
             grounding = YFinanceQuoteProvider().fetch(symbol)
             evidence_repository.append(grounding)
@@ -246,7 +248,7 @@ def _render_live_workflow(connection: sqlite3.Connection) -> None:
             if st.button(
                 "2. Approve proposal",
                 type="primary",
-                use_container_width=True,
+                width="stretch",
             ):
                 try:
                     approval = ApprovalService(proposals).approve(
@@ -274,7 +276,7 @@ def _render_live_workflow(connection: sqlite3.Connection) -> None:
                 "Rejection reason",
                 value="Operator rejected recommendation.",
             )
-            if st.button("Reject proposal", use_container_width=True):
+            if st.button("Reject proposal", width="stretch"):
                 try:
                     proposals.reject(proposal.proposal_id, rejection_reason)
                     _record_event(
@@ -299,7 +301,7 @@ def _render_live_workflow(connection: sqlite3.Connection) -> None:
         if st.button(
             "3. Verify fresh evidence and attempt execution",
             type="primary",
-            use_container_width=True,
+            width="stretch",
         ):
             fresh = None
             try:
@@ -388,7 +390,7 @@ def _render_recent_audit(
         return
     st.dataframe(
         [dict(row) for row in rows],
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -397,11 +399,12 @@ def _render_governance_proof() -> None:
     st.subheader("Insufficient-cash governance proof")
     st.write(
         "This is the deterministic proof case from the governed core: an approved "
-        "AAPL purchase is attempted at $210 with only $100 in cash."
+        "AAPL purchase is attempted at USD 210 with only USD 100 in cash."
     )
 
     if st.button("Run insufficient-cash proof", type="primary"):
-        _, failure = run_deterministic_demo()
+        with redirect_stdout(io.StringIO()):
+            _, failure = run_deterministic_demo()
         st.session_state["cash_proof"] = {
             "proposal_status_before": failure.before.status.value,
             "proposal_status_after": failure.after.status.value,
@@ -429,12 +432,10 @@ def _render_governance_proof() -> None:
         columns[2].metric(
             "Cash",
             f"${Decimal(proof['cash_after']):,.2f}",
-            delta="$0.00",
         )
         columns[3].metric(
             "AAPL shares",
             proof["quantity_after"],
-            delta=proof["quantity_after"] - proof["quantity_before"],
         )
         st.caption(
             "Human approval was real evidence of authorization. It still could not "
@@ -459,7 +460,7 @@ def _render_evidence_view(connection: sqlite3.Connection) -> None:
         st.markdown("#### Market evidence")
         st.dataframe(
             [dict(row) for row in evidence_rows],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
     else:
