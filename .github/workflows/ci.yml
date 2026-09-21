@@ -24,6 +24,9 @@ jobs:
       - name: Sync dependencies
         run: uv sync --locked --dev
 
+      - name: Compile source
+        run: uv run python -m compileall -q src
+
       - name: Run tests
         run: uv run pytest -q
 
